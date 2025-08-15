@@ -1,4 +1,4 @@
-name = "gemini-antiblock-proxy"
+name = "gemini-antiblock"
 main = "index.js"
 compatibility_date = "2023-10-16"
 

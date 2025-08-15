@@ -4,9 +4,6 @@ FROM node:20-slim
 # 设置工作目录
 WORKDIR /app
 
-# 设置 npm 为国内镜像源以加速
-RUN npm config set registry https://registry.npmmirror.com
-
 # 全局安装 wrangler
 RUN npm install -g wrangler
 

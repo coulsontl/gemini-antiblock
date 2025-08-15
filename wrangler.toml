@@ -1,0 +1,10 @@
+name = "gemini-antiblock-proxy"
+main = "index.js"
+compatibility_date = "2023-10-16"
+
+[vars]
+UPSTREAM_URL_BASE = "https://generativelanguage.googleapis.com"
+MAX_CONSECUTIVE_RETRIES = "100"
+DEBUG_MODE = "true"
+RETRY_DELAY_MS = "750"
+SWALLOW_THOUGHTS_AFTER_RETRY = "true"

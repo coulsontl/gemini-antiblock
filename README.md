@@ -15,32 +15,37 @@ A Cloudflare Worker proxy for the Gemini API with robust streaming retry capabil
 The proxy can be configured using environment variables. Create a `wrangler.toml` file in the project root with the following format:
 
 ```toml
-name = "gemini-antiblock"
-main = "index.js"
-compatibility_date = "2023-10-16"
+name = "gemini-anti-truncate"
+main = "src/index.js"
+compatibility_date = "2024-04-05"
+
+[observability.logs]
+enabled = true
 
 [vars]
-UPSTREAM_URL_BASE = "https://generativelanguage.googleapis.com"
-MAX_CONSECUTIVE_RETRIES = "100"
+# --- 核心配置 ---
+# GPTLoad地址 (必填)
+UPSTREAM_URL_BASE = "https://<你的gptload地址>/proxy/gemini"
+
+# 单次请求的最大重试次数 (可选, 默认为 10)
+MAX_RETRIES = 20
+
+# 调试模式 (可选, 默认为 true)
 DEBUG_MODE = "true"
-RETRY_DELAY_MS = "750"
-SWALLOW_THOUGHTS_AFTER_RETRY = "true"
 ```
 
 ### Environment Variables
 
 - `UPSTREAM_URL_BASE`: The base URL for the upstream Gemini API (default: "https://generativelanguage.googleapis.com")
-- `MAX_CONSECUTIVE_RETRIES`: Maximum number of retry attempts (default: 100)
+- `MAX_RETRIES`: Maximum number of retry attempts (default: 100)
 - `DEBUG_MODE`: Enable debug logging (default: true)
-- `RETRY_DELAY_MS`: Delay between retry attempts in milliseconds (default: 750)
-- `SWALLOW_THOUGHTS_AFTER_RETRY`: Filter thoughts after a retry (default: true)
 
 ## Docker Deployment
 
 To run the proxy using Docker with custom configuration:
 
 ```bash
-docker run -p 8080:8080 -v $(pwd)/wrangler.toml:/app/wrangler.toml your-dockerhub-username/gemini-antiblock:latest
+docker run -p 8080:8080 -v $(pwd)/wrangler.toml:/app/wrangler.toml your-dockerhub-username/gemini-antiblock:develop
 ```
 
 This command maps your local `wrangler.toml` file to the container, allowing you to customize the proxy configuration.

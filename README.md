@@ -84,3 +84,7 @@ Once deployed, the proxy will be available at `http://localhost:8080` and can be
 ## License
 
 This project is licensed under the MIT License.
+
+## Code Source
+
+The code in this project originates from https://linux.do/t/topic/879281. This project only provides Docker encapsulation without any code modifications.

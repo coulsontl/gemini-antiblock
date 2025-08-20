@@ -2,6 +2,10 @@
 
 A Cloudflare Worker proxy for the Gemini API with robust streaming retry capabilities and standardized error responses. This proxy handles model "thought" processes and can filter thoughts after retries to maintain a clean output stream.
 
+## Code Source
+
+The code in this project originates from https://linux.do/t/topic/879281. This project only provides Docker encapsulation without any code modifications.
+
 ## Features
 
 - **Streaming Retry**: Automatically retries failed streaming requests with accumulated context
@@ -84,7 +88,3 @@ Once deployed, the proxy will be available at `http://localhost:8080` and can be
 ## License
 
 This project is licensed under the MIT License.
-
-## Code Source
-
-The code in this project originates from https://linux.do/t/topic/879281. This project only provides Docker encapsulation without any code modifications.

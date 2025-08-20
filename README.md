@@ -49,7 +49,7 @@ DEBUG_MODE = "true"
 To run the proxy using Docker with custom configuration:
 
 ```bash
-docker run -p 8080:8080 -v $(pwd)/wrangler.toml:/app/wrangler.toml your-dockerhub-username/gemini-antiblock:develop
+docker run -p 8080:8080 -v $(pwd)/wrangler.toml:/app/wrangler.toml coulsontl/gemini-antiblock:develop
 ```
 
 This command maps your local `wrangler.toml` file to the container, allowing you to customize the proxy configuration.

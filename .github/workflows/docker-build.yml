@@ -3,7 +3,7 @@ name: Build and Push Docker Image
 on:
   push:
     branches:
-      - master
+      - develop
     paths-ignore:
       - 'README.md'
       - 'CLAUDE.md'
@@ -34,7 +34,7 @@ jobs:
         with:
           images: ${{ secrets.DOCKERHUB_USERNAME }}/gemini-antiblock
           tags: |
-            type=raw,value=latest
+            type=raw,value=develop
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v4

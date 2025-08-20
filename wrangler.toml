@@ -1,10 +1,18 @@
-name = "gemini-antiblock"
-main = "index.js"
-compatibility_date = "2023-10-16"
+# Cloudflare Worker 配置文件
+name = "gemini-anti-truncate"
+main = "src/index.js"
+compatibility_date = "2024-04-05"
+
+[observability.logs]
+enabled = true
 
 [vars]
-UPSTREAM_URL_BASE = "https://generativelanguage.googleapis.com"
-MAX_CONSECUTIVE_RETRIES = "100"
+# --- 核心配置 ---
+# GPTLoad地址 (必填)
+UPSTREAM_URL_BASE = "https://<你的gptload地址>/proxy/gemini"
+
+# 单次请求的最大重试次数 (可选, 默认为 10)
+MAX_RETRIES = 20
+
+# 调试模式 (可选, 默认为 true)
 DEBUG_MODE = "true"
-RETRY_DELAY_MS = "750"
-SWALLOW_THOUGHTS_AFTER_RETRY = "true"

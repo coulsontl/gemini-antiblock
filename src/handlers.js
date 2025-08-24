@@ -9,19 +9,26 @@ import {
   RETRYABLE_STATUS_CODES,
   FATAL_STATUS_CODES,
   MAX_FETCH_RETRIES,
-  MAX_NON_RETRYABLE_STATUS_RETRIES
+  MAX_NON_RETRYABLE_STATUS_RETRIES,
+  // BEGIN_TOKEN
 } from "./constants.js";
 import {
-  injectFinishTokenPrompt,
+  isCherryRequest,
+  injectSystemPrompts,
   isResponseComplete,
+  isFormalResponseStarted,
   cleanFinalText,
   buildRetryRequest,
   buildUpstreamRequest,
   parseParts,
   isStructuredOutputRequest,
-  processSSEDataLine,
+  createWrappedFetch,
+  // processSSEDataLine,
 } from "./core.js";
 import { logDebug, jsonError } from "./utils.js";
+
+// 创建包装后的 fetch 函数
+const wrappedFetch = createWrappedFetch(fetch);
 
 /**
  * Handles non-streaming requests with a retry mechanism.
@@ -37,7 +44,7 @@ export async function handleNonStreamingRequest(request, config, url) {
     logDebug(config.debugMode, "Passing through non-streaming request without modification.");
     const upstreamUrl = `${config.upstreamUrlBase}${url.pathname}${url.search}`;
     const upstreamRequest = new Request(upstreamUrl, request);
-    return fetch(upstreamRequest);
+    return wrappedFetch(upstreamRequest);
   }
 
   let attempts = 0;
@@ -48,13 +55,37 @@ export async function handleNonStreamingRequest(request, config, url) {
     logDebug(config.debugMode, "Structured output request detected. Passing through without modification.");
     const upstreamUrl = `${config.upstreamUrlBase}${url.pathname}${url.search}`;
     const upstreamRequest = buildUpstreamRequest(upstreamUrl, request, originalRequestBody);
-    return fetch(upstreamRequest);
+    return wrappedFetch(upstreamRequest);
   }
 
-  let injectedOriginalRequestBody = injectFinishTokenPrompt(originalRequestBody, config);
-  let currentRequestBody = structuredClone(injectedOriginalRequestBody);
-  let accumulatedText = "";
-  let allThoughtParts = []; // Accumulate thought parts from all attempts
+  // 处理 thinkingBudget
+  let injectBeginTokenPrompt = true;
+  let originalThinkingBudget = originalRequestBody.generationConfig?.thinkingConfig?.thinkingBudget;
+
+  // 检查 thinkingBudget 是否存在且为0
+  if (originalThinkingBudget !== undefined && originalThinkingBudget === 0) {
+    injectBeginTokenPrompt = false;
+  }
+
+  // 如果 thinkingBudget 存在且不为0，将其规范在128-32768之间
+  if (originalThinkingBudget !== undefined && originalThinkingBudget !== 0) {
+    if (originalThinkingBudget < 128) {
+      originalRequestBody.generationConfig.thinkingConfig.thinkingBudget = 128;
+    } else if (originalThinkingBudget > 32768) {
+      originalRequestBody.generationConfig.thinkingConfig.thinkingBudget = 32768;
+    }
+  }
+
+  // 是否输出思维链
+  let originalIncludeThoughts = originalRequestBody.generationConfig?.thinkingConfig?.includeThoughts;
+  let isIncludeThoughts = originalIncludeThoughts !== undefined ? originalIncludeThoughts : true;
+
+
+
+  let currentRequestBody = injectSystemPrompts(originalRequestBody, config, injectBeginTokenPrompt, true);
+  let thoughtAccumulatedText = injectBeginTokenPrompt ? config.startOfThought : "";
+  let formalAccumulatedText = "";
+  let isThoughtFinished = !injectBeginTokenPrompt;
 
   logDebug(config.debugMode, "Starting non-streaming request handler.");
 
@@ -67,16 +98,29 @@ export async function handleNonStreamingRequest(request, config, url) {
     const upstreamRequest = buildUpstreamRequest(upstreamUrl, request, currentRequestBody);
 
     try {
-      const upstreamResponse = await fetch(upstreamRequest);
+      const upstreamResponse = await wrappedFetch(upstreamRequest);
 
       if (upstreamResponse.ok) {
         const responseJson = await upstreamResponse.json();
         // Parse parts to extract thoughts, response text, and function calls
         const parts = responseJson?.candidates?.[0]?.content?.parts || [];
-        const parsedParts = parseParts(parts);
 
         // Check if response contains function call
-        if (parsedParts.hasFunctionCall) {
+        let hasFunctionCall = false;
+        let partsText = "";
+        for (const part of parts) {
+          if (part.functionCall) {
+            hasFunctionCall = true;
+            // break;
+          }
+          if (hasFunctionCall && !part.functionCall) {
+            partsText += part.text;
+            part.text = "";
+          }
+        }
+        parts.unshift({ text: cleanFinalText(partsText) });
+
+        if (hasFunctionCall) {
           logDebug(config.debugMode, "Non-streaming response contains function call. Returning as is.");
           return new Response(JSON.stringify(responseJson), {
             status: 200,
@@ -84,32 +128,35 @@ export async function handleNonStreamingRequest(request, config, url) {
           });
         }
 
-        // Accumulate only the formal response text (excluding thoughts)
-        accumulatedText += parsedParts.responseText;
-
-        // Accumulate thought parts from this attempt
-        if (parsedParts.thoughtParts && parsedParts.thoughtParts.length > 0) {
-          allThoughtParts.push(...parsedParts.thoughtParts);
+        // Process each part in the parts array
+        for (const part of parts) {
+          // logDebug(config.debugMode, `Get text: ${part.text}`);
+          if (part.text && !part.thought) {
+            if (!isThoughtFinished) {
+              // 思维尚未结束，检查当前text是否标记思维结束
+              if (isFormalResponseStarted(part.text)) {
+                isThoughtFinished = true;
+                // 将当前text添加到正式响应累积文本
+                formalAccumulatedText += part.text;
+              } else {
+                // 思维继续，累积到思维累积文本
+                thoughtAccumulatedText += part.text;
+              }
+            } else {
+              // 思维已经结束，在整个非流式处理中接下来收到的都是正式响应文本
+              formalAccumulatedText += part.text;
+            }
+          }
         }
 
-        if (isResponseComplete(accumulatedText)) {
+        if (isThoughtFinished && isResponseComplete(formalAccumulatedText)) {
           logDebug(config.debugMode, "Non-streaming response is complete.");
           // Clean the final text and reconstruct the parts array
           const finalParts = [];
-          // Add all accumulated thought parts first, with cleaned text
-          for (const thoughtPart of allThoughtParts) {
-            if (thoughtPart.text) {
-              // Create a new object with cleaned text
-              finalParts.push({
-                ...thoughtPart,
-                text: cleanFinalText(thoughtPart.text)
-              });
-            } else {
-              finalParts.push(thoughtPart);
-            }
-          }
+          // Add thought accumulated text
+          isIncludeThoughts && finalParts.push({ text: thoughtAccumulatedText, thought: true });
           // Add the cleaned response text
-          finalParts.push({ text: cleanFinalText(accumulatedText) });
+          finalParts.push({ text: cleanFinalText(formalAccumulatedText) });
 
           responseJson.candidates[0].content.parts = finalParts;
           return new Response(JSON.stringify(responseJson), {
@@ -118,7 +165,7 @@ export async function handleNonStreamingRequest(request, config, url) {
           });
         } else {
           logDebug(config.debugMode, "Non-streaming response is incomplete. Preparing for retry.");
-          currentRequestBody = buildRetryRequest(injectedOriginalRequestBody, accumulatedText);
+          currentRequestBody = buildRetryRequest(currentRequestBody, thoughtAccumulatedText + formalAccumulatedText);
         }
       } else {
         logDebug(config.debugMode, `Non-streaming attempt ${attempts} failed with status ${upstreamResponse.status}`);
@@ -149,20 +196,13 @@ export async function handleNonStreamingRequest(request, config, url) {
 
   // Construct final response with all accumulated thought parts and incomplete text
   const finalParts = [];
-  // Add all accumulated thought parts first, with cleaned text
-  for (const thoughtPart of allThoughtParts) {
-    if (thoughtPart.text) {
-      // Create a new object with cleaned text
-      finalParts.push({
-        ...thoughtPart,
-        text: cleanFinalText(thoughtPart.text)
-      });
-    } else {
-      finalParts.push(thoughtPart);
-    }
+  // Add thought accumulated text if it exists
+  if (injectBeginTokenPrompt && thoughtAccumulatedText) {
+    // thoughtAccumulatedText does not contain BEGIN/FINISHED tokens, so no cleaning needed.
+    finalParts.push({ text: thoughtAccumulatedText, thought: true });
   }
-  // Add the incomplete text
-  finalParts.push({ text: `${accumulatedText}\n${INCOMPLETE_TOKEN}` });
+  // Add the incomplete text, ensuring any partial tokens are cleaned.
+  finalParts.push({ text: `${cleanFinalText(formalAccumulatedText)}\n${INCOMPLETE_TOKEN}` });
 
   const finalJson = {
     candidates: [{
@@ -192,7 +232,7 @@ export async function handleStreamingRequest(request, config, url) {
     logDebug(config.debugMode, "Passing through streaming request without modification.");
     const upstreamUrl = `${config.upstreamUrlBase}${url.pathname}${url.search}`;
     const upstreamRequest = new Request(upstreamUrl, request);
-    return fetch(upstreamRequest);
+    return wrappedFetch(upstreamRequest);
   }
 
   const originalRequestBody = await request.json();
@@ -202,10 +242,34 @@ export async function handleStreamingRequest(request, config, url) {
     logDebug(config.debugMode, "Structured output request detected. Passing through without modification.");
     const upstreamUrl = `${config.upstreamUrlBase}${url.pathname}${url.search}`;
     const upstreamRequest = buildUpstreamRequest(upstreamUrl, request, originalRequestBody);
-    return fetch(upstreamRequest);
+    return wrappedFetch(upstreamRequest);
   }
 
-  let accumulatedText = ""; // Accumulates text across all retry attempts
+
+  // 检查是不是Cherry Studio客户端的请求
+  let isFromCherryRequest = isCherryRequest(request);
+
+  // 处理 thinkingBudget
+  let injectBeginTokenPrompt = true;
+  let originalThinkingBudget = originalRequestBody.generationConfig?.thinkingConfig?.thinkingBudget;
+
+  // 检查 thinkingBudget 是否存在且为0
+  if (originalThinkingBudget !== undefined && originalThinkingBudget === 0) {
+    injectBeginTokenPrompt = false;
+  }
+
+  // 如果 thinkingBudget 存在且不为0，将其规范在128-32768之间
+  if (originalThinkingBudget !== undefined && originalThinkingBudget !== 0) {
+    if (originalThinkingBudget < 128) {
+      originalRequestBody.generationConfig.thinkingConfig.thinkingBudget = 128;
+    } else if (originalThinkingBudget > 32768) {
+      originalRequestBody.generationConfig.thinkingConfig.thinkingBudget = 32768;
+    }
+  }
+
+  // 是否输出思维链
+  let originalIncludeThoughts = originalRequestBody.generationConfig?.thinkingConfig?.includeThoughts;
+  let isIncludeThoughts = originalIncludeThoughts !== undefined ? originalIncludeThoughts : true;
 
   logDebug(config.debugMode, "Starting streaming request handler.");
 
@@ -214,464 +278,393 @@ export async function handleStreamingRequest(request, config, url) {
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
 
+  let isThoughtFinished = !injectBeginTokenPrompt;; // 在外部定义，以便在 process 和心跳函数中共享
+
   const TOKEN_LEN = FINISHED_TOKEN.length;
-  const LOOKAHEAD_SIZE = TOKEN_LEN + 4; // As per user's suggestion
+  const LOOKAHEAD_SIZE = TOKEN_LEN + 4;
 
   const process = async () => {
     let attempts = 0;
-    let injectedOriginalRequestBody = injectFinishTokenPrompt(originalRequestBody, config);
-    let currentRequestBody = structuredClone(injectedOriginalRequestBody);
-    let hasFunctionCallInStream = false; // Flag to track if function call was detected in the stream
-    let passthroughMode = false; // Flag to track if we should just pass through all data
+    let currentRequestBody = injectSystemPrompts(originalRequestBody, config, injectBeginTokenPrompt, true);
+    //let accumulatedText = injectBeginTokenPrompt ? config.startOfThought : ""; // Accumulates all *sent* non-garbage text for retries
 
-    // --- Buffers for the current attempt ---
-    let lineBuffer = ""; // For handling incomplete lines from chunks
-    let textBuffer = ""; // Accumulates text content for lookahead logic
-    let linesBuffer = []; // Accumulates original SSE lines corresponding to textBuffer
-    let streamTextThisAttempt = ""; // Text that has been forwarded to client in this attempt
-
-    // Buffer size limits to prevent memory issues
-    const MAX_LINE_BUFFER_SIZE = 1000000; // 1MB
-    const MAX_TEXT_BUFFER_SIZE = 500000; // 500KB
-    const MAX_LINES_BUFFER_SIZE = 100; // 100 lines
-    // --- End of Buffers ---
+    // 在外部定义这些变量，以便在错误处理中使用
+    let lineBuffer = "";
+    let textBuffer = ""; // Buffer for lookahead
+    let linesBuffer = []; // Buffer of objects: { rawLine, isTransitionLine, text }
+    let isFirstOutput = true;
 
     while (attempts <= config.maxRetries) {
       attempts++;
       logDebug(config.debugMode, `Streaming attempt ${attempts}/${config.maxRetries + 1}`);
 
+      let hasGotBeginToken = false;
+      let accumulatedTextThisAttempt = (injectBeginTokenPrompt && isFirstOutput) ? config.startOfThought : ""; // Accumulates all *sent* non-garbage text for retries
+      let hasFunctionCallInStream = false;
+      let passthroughMode = false;
+
+      // 重置缓冲区
+      lineBuffer = "";
+      textBuffer = ""; // Buffer for lookahead
+      linesBuffer = []; // Buffer of objects: { rawLine, isTransitionLine, text }
+
       const upstreamUrl = `${config.upstreamUrlBase}${url.pathname}${url.search}`;
-      logDebug(config.debugMode, `Upstream URL: ${upstreamUrl}`);
       const upstreamRequest = buildUpstreamRequest(upstreamUrl, request, currentRequestBody);
 
-      // Reset buffers for each attempt
-      lineBuffer = "";
-      textBuffer = "";
-      linesBuffer = [];
-      streamTextThisAttempt = "";
-
       try {
-        const upstreamResponse = await fetch(upstreamRequest);
+        const upstreamResponse = await wrappedFetch(upstreamRequest);
 
         if (upstreamResponse.ok) {
           const reader = upstreamResponse.body.getReader();
-          // streamTextThisAttempt is now defined at the function level to track forwarded text
+
+          // 添加动态超时机制
+          let timeoutId;
+          let lastDataTime = Date.now();
+          let isFirstData = true; // 标记是否是第一次数据
+          const INITIAL_TIMEOUT_DURATION = 20000; // 首次20秒超时
+          const SUBSEQUENT_TIMEOUT_DURATION = 4000; // 后续4秒超时
+
+          // 创建一个Promise，用于超时处理
+          const createTimeoutPromise = () => {
+            const timeoutDuration = isFirstData ? INITIAL_TIMEOUT_DURATION : SUBSEQUENT_TIMEOUT_DURATION;
+            return new Promise((resolve) => {
+              timeoutId = setTimeout(() => {
+                resolve({ timeout: true });
+              }, timeoutDuration);
+            });
+          };
+
 
           while (true) {
-            const { value, done } = await reader.read();
+            // 使用Promise.race来竞争reader.read()和超时
+            let result = await Promise.race([
+              reader.read(),
+              createTimeoutPromise()
+            ]);
 
-            // --- Chunk Processing ---
-            // Process value first to ensure data is handled even when done is true
+            // 如果超时，则设置done为true并继续处理
+            if (result.timeout) {
+              logDebug(config.debugMode, `Stream timeout after ${TIMEOUT_DURATION / 1000} seconds of inactivity. Closing stream.`);
+              result = { value: undefined, done: true };
+            }
+
+            const { value, done } = result;
+
+            // 如果有新数据，则重置超时计时器
+            if (value) {
+              clearTimeout(timeoutId);
+              lastDataTime = Date.now();
+              // 如果是第一次数据，将isFirstData设置为false，以便后续使用4秒超时
+              if (isFirstData) {
+                isFirstData = false;
+                logDebug(config.debugMode, "First data received. Switching to 4-second timeout.");
+              }
+            }
+
             if (value) {
               const chunkString = decoder.decode(value, { stream: true });
 
-              // If in passthrough mode, just forward the chunk directly
               if (passthroughMode) {
                 writer.write(encoder.encode(chunkString));
-              } else {
-                const processableString = lineBuffer + chunkString;
+                continue;
+              }
 
-                // Check if lineBuffer is getting too large
-                if (processableString.length > MAX_LINE_BUFFER_SIZE) {
-                  logDebug(config.debugMode, "Line buffer exceeding maximum size, truncating");
-                  // Force split at the maximum size to prevent memory issues
-                  const truncatedString = processableString.substring(0, MAX_LINE_BUFFER_SIZE);
-                  const lines = truncatedString.split(/\r?\n\r?\n/);
-                  lineBuffer = ""; // Clear buffer to prevent accumulation
-                  for (const line of lines) {
-                    if (line) {
-                      // Process each line immediately to prevent buffer buildup
-                      if (line.startsWith('data:')) {
-                        const buffers = { textBuffer, linesBuffer };
-                        const flags = { hasFunctionCallInStream, hasOnlyThoughtContent: false };
-                        const result = processSSEDataLine(line, buffers, config.debugMode, flags);
-                        // Update the buffers and flags from the function
-                        textBuffer = buffers.textBuffer;
-                        hasFunctionCallInStream = flags.hasFunctionCallInStream;
+              const processableString = lineBuffer + chunkString;
+              const lines = processableString.split(/\r?\n\r?\n/);
+              lineBuffer = lines.pop() || "";
 
-                        // Print response text for debugging (from second attempt onwards)
-                        if (attempts > 1 && config.debugMode && result && result.parsedParts && result.parsedParts.responseText) {
-                          console.log(`[DEBUG ${new Date().toISOString()}] Attempt ${attempts}, received response text: "${result.parsedParts.responseText}"`);
-                        }
+              for (const line of lines) {
+                if (!line.startsWith('data:')) {
+                  if (line) writer.write(encoder.encode(line + '\n\n'));
+                  continue;
+                }
 
-                        // Check if function call was detected
-                        if (hasFunctionCallInStream && !passthroughMode) {
-                          logDebug(config.debugMode, "Function call detected. Switching to passthrough mode and releasing buffers.");
-                          // Forward all buffered lines immediately
-                          if (linesBuffer.length > 0) {
-                            writer.write(encoder.encode(linesBuffer.join('\n\n') + '\n\n'));
-                            linesBuffer = [];
-                            textBuffer = "";
-                          }
-                          passthroughMode = true;
-                          // Forward all remaining lines in the current chunk
-                          const currentLineIndex = lines.indexOf(line);
-                          const remainingLines = lines.slice(currentLineIndex + 1);
-                          if (remainingLines.length > 0) {
-                            writer.write(encoder.encode(remainingLines.join('\n\n') + '\n\n'));
-                          }
+                const jsonStr = line.substring(5).trim();
+                if (!jsonStr) continue;
 
-                          // Break out of the loop since we're now in passthrough mode
-                          break;
-                        }
+                try {
+                  const data = JSON.parse(jsonStr);
+                  const parts = data?.candidates?.[0]?.content?.parts || [];
+                  const parsedParts = parseParts(parts);
 
-                        // Check if this line contains only thought content (no response text)
-                        if (flags.hasOnlyThoughtContent) {
-                          logDebug(config.debugMode, "Line contains only thought content. Forwarding immediately.");
-
-                          // Clean text in parts before forwarding
-                          const jsonStr = line.substring(5).trim();
-                          const data = JSON.parse(jsonStr);
-
-                          // When the stream contains only thought content, the finishReason is often "STOP",
-                          // which can cause the client to prematurely close the connection.
-                          // By removing finishReason, we allow the stream to continue.
-                          if (data.candidates?.[0]) {
-                            delete data.candidates[0].finishReason;
-
-                            for (const part of data.candidates[0].content?.parts || []) {
-                              if (part.text) {
-                                part.text = cleanFinalText(part.text);
-                              }
-                            }
-                          }
-                          const cleanedLine = `data: ${JSON.stringify(data)}`;
-
-                          writer.write(encoder.encode(cleanedLine + '\n\n'));
-                          // Remove this line from the linesBuffer since it's already forwarded
-                          const index = linesBuffer.indexOf(line);
-                          if (index !== -1) {
-                            linesBuffer.splice(index, 1);
-                          }
-                          // Continue to the next line
-                          continue;
-                        }
-                      } else {
-                        // Forward comments, empty lines, etc. immediately with two newlines
-                        writer.write(encoder.encode(line + '\n\n'));
-                      }
-                    }
-                  }
-                } else {
-                  // Split by two newlines as per user feedback
-                  const lines = processableString.split(/\r?\n\r?\n/);
-                  lineBuffer = lines.pop() || ""; // Last line might be incomplete
-
-                  for (const line of lines) {
-                    if (line.startsWith('data:')) {
-                      const buffers = { textBuffer, linesBuffer };
-                      const flags = { hasFunctionCallInStream, hasOnlyThoughtContent: false };
-                      const result = processSSEDataLine(line, buffers, config.debugMode, flags);
-                      // Update the buffers and flags from the function
-                      textBuffer = buffers.textBuffer;
-                      hasFunctionCallInStream = flags.hasFunctionCallInStream;
-
-                      // Print response text for debugging (from second attempt onwards)
-                      if (attempts > 1 && config.debugMode && result && result.parsedParts && result.parsedParts.responseText) {
-                        console.log(`[DEBUG ${new Date().toISOString()}] Attempt ${attempts}, received response text: "${result.parsedParts.responseText}"`);
-                      }
-
-                      // Check if function call was detected
-                      if (hasFunctionCallInStream && !passthroughMode) {
-                        logDebug(config.debugMode, "Function call detected. Switching to passthrough mode and releasing buffers.");
-                        // Forward all buffered lines immediately
-                        if (linesBuffer.length > 0) {
-                          writer.write(encoder.encode(linesBuffer.join('\n\n') + '\n\n'));
-                          linesBuffer = [];
-                          textBuffer = "";
-                        }
-                        passthroughMode = true;
-                        // Forward all remaining lines in the current chunk
-                        const currentLineIndex = lines.indexOf(line);
-                        const remainingLines = lines.slice(currentLineIndex + 1);
-                        if (remainingLines.length > 0) {
-                          writer.write(encoder.encode(remainingLines.join('\n\n') + '\n\n'));
-                        }
-
-                        // Break out of the loop since we're now in passthrough mode
-                        break;
-                      }
-
-                      // Check if this line contains only thought content (no response text)
-                      if (flags.hasOnlyThoughtContent) {
-                        logDebug(config.debugMode, "Line contains only thought content. Forwarding immediately.");
-
-                        // Clean text in parts before forwarding
-                        const jsonStr = line.substring(5).trim();
-                        const data = JSON.parse(jsonStr);
-
-                        // When the stream contains only thought content, the finishReason is often "STOP",
-                        // which can cause the client to prematurely close the connection.
-                        // By removing finishReason, we allow the stream to continue.
-                        if (data.candidates?.[0]) {
-                          delete data.candidates[0].finishReason;
-
-                          for (const part of data.candidates[0].content?.parts || []) {
-                            if (part.text) {
-                              part.text = cleanFinalText(part.text);
-                            }
-                          }
-                        }
-                        const cleanedLine = `data: ${JSON.stringify(data)}`;
-
-                        writer.write(encoder.encode(cleanedLine + '\n\n'));
-                        // Remove this line from the linesBuffer since it's already forwarded
-                        const index = linesBuffer.indexOf(line);
-                        if (index !== -1) {
-                          linesBuffer.splice(index, 1);
-                        }
-                        // Continue to the next line
-                        continue;
-                      }
-                    } else {
-                      // Forward comments, empty lines, etc. immediately with two newlines
-                      writer.write(encoder.encode(line + '\n\n'));
-                    }
+                  if (parsedParts.hasFunctionCall) {
+                    hasFunctionCallInStream = true;
                   }
 
-                  // Skip lookahead and safe forwarding if in passthrough mode
-                  if (!passthroughMode) {
-                    // --- Lookahead and Safe Forwarding Logic ---
-
-                    // Check if textBuffer is exceeding maximum size
-                    if (textBuffer.length > MAX_TEXT_BUFFER_SIZE) {
-                      logDebug(config.debugMode, "Text buffer exceeding maximum size, forcing forward");
-                      // Force forward all buffered lines to prevent memory issues
-                      if (linesBuffer.length > 0) {
-                        writer.write(encoder.encode(linesBuffer.join('\n\n') + '\n\n'));
-                        linesBuffer = [];
-                        textBuffer = "";
-                      }
-                    }
-
-                    // Check if linesBuffer is exceeding maximum size
-                    if (linesBuffer.length > MAX_LINES_BUFFER_SIZE) {
-                      logDebug(config.debugMode, "Lines buffer exceeding maximum size, forcing forward");
-                      // Force forward all buffered lines to prevent memory issues
-                      if (linesBuffer.length > 0) {
-                        writer.write(encoder.encode(linesBuffer.join('\n\n') + '\n\n'));
-                        linesBuffer = [];
-                        textBuffer = "";
-                      }
-                    }
-
-                    if (textBuffer.length > LOOKAHEAD_SIZE) {
-                      const safeTextLength = textBuffer.length - LOOKAHEAD_SIZE;
-                      let forwardedTextLength = 0;
-
-                      while (linesBuffer.length > 0) {
-                        const currentLine = linesBuffer[0];
-                        let currentLineTextLength = 0;
-                        let currentLineText = "";
-
-                        if (currentLine.startsWith('data:')) {
-                          try {
-                            const jsonStr = currentLine.substring(5).trim();
-                            if (jsonStr) {
-                              const data = JSON.parse(jsonStr);
-                              // Parse parts to extract only the formal response text length
-                              const parts = data?.candidates?.[0]?.content?.parts || [];
-                              const parsedParts = parseParts(parts);
-                              currentLineTextLength = parsedParts.responseText.length || 0;
-                              currentLineText = parsedParts.responseText || "";
-                            }
-                          } catch (e) { /* ignore, length 0 */ }
-                        }
-
-                        if (forwardedTextLength + currentLineTextLength <= safeTextLength) {
-                          // Remove the line from buffer and add to forward list
-                          const lineToForward = linesBuffer.shift();
-                          writer.write(encoder.encode(lineToForward + '\n\n'));
-                          // Update streamTextThisAttempt with the text being forwarded
-                          streamTextThisAttempt += currentLineText;
-                          forwardedTextLength += currentLineTextLength;
-                        } else {
-                          break; // Cannot forward this line safely
-                        }
-                      }
-
-                      // Trim the textBuffer accordingly, ensuring we don't break multi-byte characters
-                      // Use a safe approach to trim by character count instead of byte count
-                      textBuffer = textBuffer.slice(forwardedTextLength);
-                    }
-                    // --- End of Lookahead and Safe Forwarding ---
+                  if (parsedParts.hasThought && !parsedParts.responseText && !parsedParts.hasFunctionCall) {
+                    logDebug(config.debugMode, "Skipping garbage thought-only part.");
+                    continue;
                   }
+
+                  if (hasFunctionCallInStream && !passthroughMode) {
+                    logDebug(config.debugMode, "Function call detected. Switching to passthrough mode.");
+                    // Forward all buffered lines immediately
+                    if (linesBuffer.length > 0) {
+                      let lastline = linesBuffer.pop().rawLine;
+                      let lastlineJson = JSON.parse(lastline.substring(5).trim());
+                      lastlineJson.candidates[0].content.parts = { text: cleanFinalText(textBuffer) };
+                      lastline = `data: ${JSON.stringify(lastlineJson)}\n\n`;
+                      writer.write(encoder.encode(lastline + '\n\n'));
+                      linesBuffer = [];
+                      textBuffer = "";
+                      isThoughtFinished = true;
+                    }
+                    writer.write(encoder.encode(line + '\n\n'));
+                    passthroughMode = true;
+                    continue;
+                  }
+                  else if (passthroughMode) {
+                    writer.write(encoder.encode(line));
+                    continue;
+                  }
+
+                  let responseText = parsedParts.responseText || "";
+                  let isTransitionLine = false;
+                  let wasModified = false;
+
+                  if (!isThoughtFinished && !hasGotBeginToken && isFormalResponseStarted(responseText)) {
+                    hasGotBeginToken = true;
+                    isTransitionLine = true;
+                    logDebug(config.debugMode, "Transition line detected.");
+                  }
+                  else if (isThoughtFinished && !hasGotBeginToken && isFormalResponseStarted(linesBuffer[-1]?.text || "" + responseText)) {
+                    hasGotBeginToken = true;
+                    isTransitionLine = true;
+                    responseText = linesBuffer[-1].text + responseText;
+                    wasModified = true;
+                    linesBuffer.pop();
+                    logDebug(config.debugMode, "Transition line detected. It takes two lines.");
+                  }
+                  else if (isThoughtFinished && !hasGotBeginToken && isFormalResponseStarted(linesBuffer[-2]?.text || "" + linesBuffer[-1]?.text || "" + responseText)) {
+                    hasGotBeginToken = true;
+                    isTransitionLine = true;
+                    responseText = linesBuffer[-2].text + linesBuffer[-1].text + responseText;
+                    wasModified = true;
+                    linesBuffer.pop() && linesBuffer.pop();
+                    logDebug(config.debugMode, "Transition line detected. It takes three lines.");
+                  }
+
+
+
+                  let lineToStore = line;
+                  try {
+                    const data = JSON.parse(jsonStr);
+                    const parts = data?.candidates?.[0]?.content?.parts;
+
+                    if (Array.isArray(parts)) {
+                      // logDebug(config.debugMode, "parts:", parts);
+
+                      // Step 1: Filter out parts that are explicitly marked as thought.
+                      // let processedParts = parts.filter(part => !part.thought);
+                      let processedParts = [{ text: responseText }];
+                      if (processedParts.length < parts.length) {
+                        wasModified = true;
+                      }
+
+                      // Step 2: If the thought phase is not finished, all remaining text parts are considered thoughts.
+                      if (!isThoughtFinished && !hasGotBeginToken) {
+                        let markedAsThought = false;
+                        processedParts.forEach(part => {
+                          // Mark any part with text as a thought.
+                          if (part.text) {
+                            part.thought = true;
+                            markedAsThought = true;
+                          }
+                        });
+                        if (markedAsThought) {
+                          wasModified = true;
+                        }
+                      }
+
+                      if (wasModified) {
+                        data.candidates[0].content.parts = processedParts;
+                        lineToStore = `data: ${JSON.stringify(data)}`;
+                        // logDebug(config.debugMode, `Processed thoughts. New line to store: ${lineToStore}`);
+                      }
+                    }
+                  } catch (e) {
+                    logDebug(config.debugMode, "Could not process thought parts, storing raw line.", e);
+                  }
+                  linesBuffer.push({ rawLine: lineToStore, isTransitionLine, text: responseText });
+                  textBuffer += responseText;
+                  attempts > 1 && logDebug(config.debugMode, "responseText:", responseText);
+
+                } catch (e) {
+                  logDebug(config.debugMode, "Error processing SSE line, forwarding as is.", line, e);
+                  writer.write(encoder.encode(line + '\n\n'));
                 }
               }
+
+              // --- Lookahead and Safe Forwarding ---
+              if (textBuffer.length > LOOKAHEAD_SIZE) {
+                const safeTextLength = textBuffer.length - LOOKAHEAD_SIZE;
+                let forwardedTextLength = 0;
+
+                while (linesBuffer.length > 0) {
+                  const lineObject = linesBuffer[0];
+                  if (forwardedTextLength + lineObject.text.length <= safeTextLength) {
+                    linesBuffer.shift(); // Remove from buffer
+
+                    // logDebug(config.debugMode, "rawLine:", lineObject.rawLine);
+
+                    if (isFirstOutput && isIncludeThoughts) {
+                      isFirstOutput = false;
+                      writer.write(encoder.encode(`data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: accumulatedTextThisAttempt, thought: true }], role: "model" }, index: 0 }] })}\n\n`));
+                    }
+
+                    if (lineObject.isTransitionLine) {
+                      const data = JSON.parse(lineObject.rawLine.substring(5).trim());
+                      const cleanedBeginText = cleanFinalText(lineObject.text, true, false);
+                      data.candidates[0].content.parts = [{ text: cleanedBeginText }];
+                      const cleanedLine = `data: ${JSON.stringify(data)}`;
+                      writer.write(encoder.encode(cleanedLine + '\n\n'));
+                      isThoughtFinished = true;
+                      logDebug(config.debugMode, "BEGIN_TOKEN line sent, thought finished.");
+                    } else {
+                      (isIncludeThoughts || isThoughtFinished) && writer.write(encoder.encode(lineObject.rawLine + '\n\n'));
+                    }
+
+                    accumulatedTextThisAttempt += lineObject.text;
+                    forwardedTextLength += lineObject.text.length;
+                  } else {
+                    break;
+                  }
+                }
+                textBuffer = textBuffer.slice(forwardedTextLength);
+              }
             }
-            // --- End of Chunk Processing ---
 
-            // Then check if stream is done
             if (done) {
-              // --- End of Stream Processing ---
-              logDebug(config.debugMode, "Upstream stream ended for this attempt.");
-
               if (passthroughMode) {
                 writer.close();
                 return;
               }
 
-              // Process any remaining lines in the buffer
-              if (lineBuffer) {
-                const line = lineBuffer;
-                lineBuffer = ""; // Clear buffer
+              // Stream has ended. Process all remaining buffered content to make a final decision.
+              // Note: We don't add to `accumulatedTextThisAttempt` here yet. That's only for retries.
 
-                if (line.startsWith('data:')) {
-                  const buffers = { textBuffer, linesBuffer };
-                  const flags = { hasFunctionCallInStream, hasOnlyThoughtContent: false };
-                  const result = processSSEDataLine(line, buffers, config.debugMode, flags);
-                  // Update the buffers and flags from the function
-                  textBuffer = buffers.textBuffer;
-                  hasFunctionCallInStream = flags.hasFunctionCallInStream;
+              // logDebug(config.debugMode, "sse done");
 
-                  // Print response text for debugging (from second attempt onwards)
-                  if (attempts > 1 && config.debugMode && result && result.parsedParts && result.parsedParts.responseText) {
-                    console.log(`[DEBUG ${new Date().toISOString()}] Attempt ${attempts}, received response text: "${result.parsedParts.responseText}"`);
-                  }
+              if ((hasGotBeginToken || isThoughtFinished) && isResponseComplete(textBuffer)) {
+                logDebug(config.debugMode, "Streaming response is complete. Constructing final payload from buffers. textBuffer:", textBuffer);
 
-                  // Check if this line contains only thought content (no response text)
-                  if (flags.hasOnlyThoughtContent) {
-                    logDebug(config.debugMode, "Line contains only thought content. Forwarding immediately.");
+                // logDebug(config.debugMode, "linesBuffer content:", JSON.stringify(linesBuffer, null, 2));
 
-                    // Clean text in parts before forwarding
-                    const jsonStr = line.substring(5).trim();
-                    const data = JSON.parse(jsonStr);
 
-                    // When the stream contains only thought content, the finishReason is often "STOP",
-                    // which can cause the client to prematurely close the connection.
-                    // By removing finishReason, we allow the stream to continue.
-                    if (data.candidates?.[0]) {
-                      delete data.candidates[0].finishReason;
-
-                      for (const part of data.candidates[0].content?.parts || []) {
-                        if (part.text) {
-                          part.text = cleanFinalText(part.text);
+                // Accumulate all thought text from the remaining lines in the buffer.
+                let thoughtTextBuffer = "";
+                let responseTextBuffer = "";
+                for (const lineObject of linesBuffer) {
+                  try {
+                    const line = lineObject.rawLine;
+                    if (line.startsWith('data:')) {
+                      const data = JSON.parse(line.substring(5).trim());
+                      const parts = data?.candidates?.[0]?.content?.parts || [];
+                      for (const part of parts) {
+                        if (part.thought && part.text) {
+                          thoughtTextBuffer += part.text;
+                        }
+                        else if (!part.thought && part.text) {
+                          responseTextBuffer += part.text;
                         }
                       }
                     }
-                    const cleanedLine = `data: ${JSON.stringify(data)}`;
-
-                    writer.write(encoder.encode(cleanedLine + '\n\n'));
-                    // Remove this line from the linesBuffer since it's already forwarded
-                    const index = linesBuffer.indexOf(line);
-                    if (index !== -1) {
-                      linesBuffer.splice(index, 1);
-                    }
-                  } else {
-                    linesBuffer.push(line); // Add to buffer for later processing
-                  }
-                } else {
-                  linesBuffer.push(line); // Forward non-data lines
+                  } catch (e) { /* ignore malformed lines */ }
                 }
-              }
 
-
-              // Check for completion with the entire textBuffer
-              if (isResponseComplete(textBuffer)) {
-                logDebug(config.debugMode, "Streaming response is complete after stream end.");
-                const cleanedText = cleanFinalText(textBuffer);
-
-                // Find the last valid data JSON line from linesBuffer as base for finalPayload
-                let basePayload = null;
+                let finalPayload = null;
+                // Find the last valid line to use as a template for metadata.
                 for (let i = linesBuffer.length - 1; i >= 0; i--) {
-                  const line = linesBuffer[i];
-                  if (line.startsWith('data:')) {
-                    try {
-                      const jsonStr = line.substring(5).trim();
-                      if (jsonStr) {
-                        const data = JSON.parse(jsonStr);
-                        if (data && data.candidates && data.candidates.length > 0) {
-                          basePayload = data;
-                          break;
-                        }
-                      }
-                    } catch (e) {
-                      // Ignore parse errors, continue to previous line
-                      logDebug(config.debugMode, `Error parsing JSON from line: ${line.substring(0, 100)}...`, e);
+                  try {
+                    const line = linesBuffer[i].rawLine;
+                    if (line.startsWith('data:')) {
+                      finalPayload = JSON.parse(line.substring(5).trim());
+                      break;
                     }
-                  }
+                  } catch (e) { /* ignore */ }
                 }
 
-                // Construct and send the final cleaned data line
-                let finalPayload;
-                if (basePayload) {
-                  // Use basePayload as foundation, only replace content parts
-                  // finalPayload = JSON.parse(JSON.stringify(basePayload)); // Deep clone
-                  finalPayload = structuredClone(basePayload); // Deep clone
-                  if (finalPayload.candidates && finalPayload.candidates.length > 0 && finalPayload.candidates[0].content) {
-                    // Preserve all other properties, just replace the content parts
-                    finalPayload.candidates[0].content.parts = [{ text: cleanedText }];
-                  }
-                  logDebug(config.debugMode, "Using base payload for final response");
-                } else {
-                  // Fallback to original simple structure if no valid base found
+                // If no valid template was found, create a default one.
+                if (!finalPayload) {
                   finalPayload = {
-                    candidates: [{
-                      content: { parts: [{ text: cleanedText }] },
-                      finishReason: "STOP"
-                    }]
+                    candidates: [{ content: { parts: [], role: "model" }, finishReason: "STOP", index: 0 }]
                   };
-                  logDebug(config.debugMode, "No valid base payload found, using simple structure");
                 }
+
+                //logDebug(config.debugMode, "thoughtTextBuffer:", thoughtTextBuffer);
+                //logDebug(config.debugMode, "responseTextBuffer:", responseTextBuffer);
+                //logDebug(config.debugMode, "finalPayload:", JSON.stringify(finalPayload, null, 2));
+
+                const finalText = cleanFinalText(responseTextBuffer);
+                //logDebug(config.debugMode, "finalText:", finalText);
+                const finalParts = [];
+                if (thoughtTextBuffer) {
+                  finalParts.push({ text: thoughtTextBuffer, thought: true });
+                }
+                if (finalText) {
+                  finalParts.push({ text: finalText });
+                }
+
+                finalPayload.candidates[0].content.parts = finalParts;
+                finalPayload.candidates[0].finishReason = "STOP";
+
+                // logDebug(config.debugMode, "finalPayload:", JSON.stringify(finalPayload, null, 2));
 
                 writer.write(encoder.encode(`data: ${JSON.stringify(finalPayload)}\n\n`));
                 writer.close();
-                return; // Success
+                return; // Success, stream finished.
               } else {
-                logDebug(config.debugMode, `Streaming response is incomplete after stream end. Preparing for retry. textBuffer: ${textBuffer}`);
-                // Do NOT forward remaining buffered lines as they don't contain the finish token
-                // streamTextThisAttempt already contains all the text that was forwarded to the client
-                accumulatedText += streamTextThisAttempt;
-                currentRequestBody = buildRetryRequest(injectedOriginalRequestBody, accumulatedText);
+                // The stream ended, but the buffered text is not a complete response.
+                // This means the model was cut off. Time to retry.
+                logDebug(config.debugMode, `Streaming response is incomplete. Preparing for retry. textBuffer:`, textBuffer);
+                currentRequestBody = buildRetryRequest(currentRequestBody, accumulatedTextThisAttempt);
                 break; // Break inner while to start next retry attempt
               }
-              // --- End of Stream Processing ---
             }
           }
         } else {
           logDebug(config.debugMode, `Streaming attempt ${attempts} failed with status ${upstreamResponse.status}`);
-
-          // Check for fatal status codes
           if (FATAL_STATUS_CODES.includes(upstreamResponse.status)) {
             logDebug(config.debugMode, `Fatal status ${upstreamResponse.status} received. Aborting retries.`);
             const errorData = await upstreamResponse.text();
             writer.write(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: { code: upstreamResponse.status, message: "Upstream API returned a fatal error.", details: errorData } })}\n\n`));
-            writer.close();
-            return; // Abort immediately
+            //writer.close();
+            //return;
+            break;
           }
-
           if (attempts > config.maxRetries) {
             const errorData = await upstreamResponse.text();
             writer.write(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: { code: upstreamResponse.status, message: "Upstream API error after max retries.", details: errorData } })}\n\n`));
-            writer.close();
-            return;
+            //writer.close();
+            //return;
+            break;
           }
         }
       } catch (error) {
         logDebug(config.debugMode, `Fetch error during streaming attempt ${attempts}:`, error);
         if (attempts > config.maxRetries) {
           writer.write(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: { code: 500, message: "Internal Server Error after max retries.", details: error.message } })}\n\n`));
-          writer.close();
-          return;
+          //writer.close();
+          //return;
+          break;
         }
       }
     }
 
     // If the loop finishes, all retries have been used up.
-    logDebug(config.debugMode, "Max retries reached for streaming request.");
-    // Any remaining content in linesBuffer from the last failed attempt should be sent.
+    logDebug(config.debugMode, "Stop attempting...");
     if (linesBuffer.length > 0) {
-      writer.write(encoder.encode(linesBuffer.join('\n\n') + '\n\n'));
+      for (const lineObj of linesBuffer) {
+        writer.write(encoder.encode(lineObj.rawLine + '\n\n'));
+      }
     }
-    // Append INCOMPLETE_TOKEN to the very end.
-    // We need to construct a final data message for this.
     const incompletePayload = {
       candidates: [{
         content: {
-          parts: [{ text: INCOMPLETE_TOKEN }] // Append directly
+          parts: [{ text: INCOMPLETE_TOKEN }]
         },
-        finishReason: "MAX_RETRIES",
-        index: 0 // Assuming index 0
+        finishReason: "FXXKED",
+        index: 0
       }]
     };
     writer.write(encoder.encode(`data: ${JSON.stringify(incompletePayload)}\n\n`));
@@ -683,12 +676,11 @@ export async function handleStreamingRequest(request, config, url) {
   // Start the heartbeat after setting up the stream, but before starting the processing
   heartbeatInterval = setInterval(() => {
     try {
-      // Check if the writer is still open and can accept data
       if (writer.desiredSize !== null && writer.desiredSize > 0) {
         logDebug(config.debugMode, "Sending SSE heartbeat.");
         const heartbeatPayload = {
           candidates: [{
-            content: { parts: [{ text: "" }], role: "model" },
+            content: (isFromCherryRequest || isThoughtFinished || !isIncludeThoughts) ? { parts: [{ text: "" }], role: "model" } : { parts: [{ text: "", thought: true }], role: "model" },
             index: 0
           }]
         };
@@ -702,7 +694,6 @@ export async function handleStreamingRequest(request, config, url) {
 
   process().catch(e => {
     logDebug(config.debugMode, "Unhandled error in streaming process:", e);
-    // Attempt to send an error event to the client if possible
     try {
       writer.write(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: { code: 500, message: "Internal worker error.", details: e.message } })}\n\n`));
       writer.close();
@@ -710,6 +701,7 @@ export async function handleStreamingRequest(request, config, url) {
   }).finally(() => {
     logDebug(config.debugMode, "Clearing SSE heartbeat interval.");
     clearInterval(heartbeatInterval);
+    // writer.close();
   });
 
   return new Response(readable, {

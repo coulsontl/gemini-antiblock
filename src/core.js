@@ -2,8 +2,168 @@
  * @fileoverview Core logic for request modification, validation, and retry preparation.
  */
 
-import { FINISH_TOKEN_PROMPT, RETRY_PROMPT, REMINDER_PROMPT, FINISHED_TOKEN } from "./constants.js";
+import { BEGIN_TOKEN_PROMPT, FINISH_TOKEN_PROMPT, REMINDER_PROMPT, BEGIN_TOKEN, FINISHED_TOKEN } from "./constants.js";
 import { logDebug } from "./utils.js";
+
+/**
+ * 生成一个简短的 UUID
+ * @returns {string} 生成的 UUID
+ */
+function generateShortUUID() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+    const r = Math.random() * 16 | 0;
+    const v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+}
+
+/**
+ * 在用户消息中注入前缀和 UUID
+ * @param {string} text - 原始文本
+ * @returns {string} 注入前缀和 UUID 后的文本
+ */
+function injectPrefixWithUUID(text) {
+  const uuid = generateShortUUID();
+  const prefix = `(Net-Request-Random-ID: ${uuid}. This is an automated marker for request tracking. Please ignore this identifier and do not reference it in your response.)`;
+  const modifiedText = `${prefix}\n\n${text}`;
+  logDebug(true, `Injected UUID prefix: ${uuid}`);
+  return modifiedText;
+}
+
+/**
+ * 在请求体中注入前缀和 UUID
+ * @param {object} requestBody - 请求体对象
+ * @returns {object} 修改后的请求体对象
+ */
+function injectUUIDPrefixToRequestBody(requestBody) {
+  if (!requestBody || !Array.isArray(requestBody.contents) || requestBody.contents.length === 0) {
+    logDebug(true, "UUID injection skipped: Invalid request body or contents");
+    return requestBody;
+  }
+
+  // 找到最后一条用户消息
+  let lastUserContent = null;
+  for (let i = requestBody.contents.length - 1; i >= 0; i--) {
+    if (requestBody.contents[i].role === "user") {
+      lastUserContent = requestBody.contents[i];
+      break;
+    }
+  }
+
+  // 如果没有找到用户消息
+  if (!lastUserContent) {
+    logDebug(true, "UUID injection skipped: No user message found in request");
+    return requestBody;
+  }
+
+  // 如果找到了用户消息，但它没有 parts 数组
+  if (!Array.isArray(lastUserContent.parts) || lastUserContent.parts.length === 0) {
+    logDebug(true, "UUID injection skipped: User message has no parts");
+    return requestBody;
+  }
+
+  // 找到最后一个含有非空 text 的 part
+  let lastTextPartIndex = -1;
+  for (let i = lastUserContent.parts.length - 1; i >= 0; i--) {
+    if (lastUserContent.parts[i].text && lastUserContent.parts[i].text.trim() !== "") {
+      lastTextPartIndex = i;
+      break;
+    }
+  }
+
+  // 如果没有找到含有非空 text 的 part
+  if (lastTextPartIndex === -1) {
+    logDebug(true, "UUID injection skipped: No text part found in user message");
+    return requestBody;
+  }
+
+  // 如果找到了含有非空 text 的 part，则注入前缀和 UUID
+  lastUserContent.parts[lastTextPartIndex].text = injectPrefixWithUUID(lastUserContent.parts[lastTextPartIndex].text);
+  return requestBody;
+}
+
+/**
+ * 包装 fetch 函数，在请求体中注入前缀和 UUID
+ * @param {Function} originalFetch - 原始的 fetch 函数
+ * @returns {Function} 包装后的 fetch 函数
+ */
+export function createWrappedFetch(originalFetch) {
+  return async function wrappedFetch(requestOrUrl, options) {
+    let request = requestOrUrl;
+    let url = requestOrUrl;
+
+    // 如果第一个参数是 Request 对象，则提取 URL 和选项
+    if (requestOrUrl instanceof Request) {
+      request = requestOrUrl;
+      url = request.url;
+      options = {
+        method: request.method,
+        headers: request.headers,
+        body: request.body,
+        ...options
+      };
+      // logDebug(true, `Processing Request object: ${url}`);
+    } else {
+      // logDebug(true, `Processing URL: ${url}`);
+    }
+
+    // 检查URL是否包含"models/gemini"（不区分大小写）
+    const isGeminiRequest = typeof url === 'string' && url.toLowerCase().includes('models/gemini');
+
+    // 如果不是Gemini请求，直接调用原始fetch函数
+    if (!isGeminiRequest) {
+      return originalFetch(requestOrUrl instanceof Request ? request : url, options);
+    }
+
+    // 只处理 POST 请求并且有请求体的情况
+    if (options && options.method === 'POST' && options.body) {
+      // logDebug(true, `Processing POST request with body type: ${typeof options.body}`);
+
+      try {
+        let requestBody;
+
+        // 如果是 Request 对象且有 body，使用 json() 方法解析
+        if (requestOrUrl instanceof Request && requestOrUrl.body) {
+          // 直接使用原始请求解析 body，因为我们之后会替换整个 body
+          requestBody = await requestOrUrl.json();
+          // logDebug(true, "Request body parsed successfully using request.json()");
+        }
+        // 如果是字符串，使用 JSON.parse 解析
+        else if (typeof options.body === 'string') {
+          requestBody = JSON.parse(options.body);
+          // logDebug(true, "Request body parsed successfully using JSON.parse()");
+        }
+        // 其他类型，跳过处理
+        else {
+          // logDebug(true, `Skipping UUID injection: Body is of unsupported type: ${typeof options.body}`);
+          return originalFetch(requestOrUrl instanceof Request ? request : url, options);
+        }
+
+        // 注入前缀和 UUID
+        const modifiedRequestBody = injectUUIDPrefixToRequestBody(requestBody);
+
+        // 更新请求体
+        options.body = JSON.stringify(modifiedRequestBody);
+
+        // 如果原始参数是 Request 对象，则创建新的 Request 对象
+        if (requestOrUrl instanceof Request) {
+          request = new Request(url, options);
+          // logDebug(true, "Created new Request object with modified body");
+        }
+      } catch (e) {
+        // 如果解析失败，不做任何修改
+        // logDebug(true, `Failed to parse request body for UUID injection: ${e.message}`);
+        console.error('Failed to parse request body for UUID injection:', e);
+      }
+    } else {
+      // logDebug(true, "Skipping UUID injection: Not a POST request or no body");
+    }
+
+    // 调用原始 fetch 函数
+    // logDebug(true, "Calling original fetch function");
+    return originalFetch(requestOrUrl instanceof Request ? request : url, options);
+  };
+}
 
 /**
  * 处理 systemInstruction 和 system_instruction 的兼容性
@@ -31,52 +191,108 @@ export function normalizeSystemInstruction(body) {
 }
 
 /**
- * Injects the system prompt for the finish token into the request body.
+ * 
+ * @param {object} body 
+ * @returns {boolean}
+ */
+export function isCherryRequest(body) {
+  return body.headers.has("User-Agent") && body.headers.get("User-Agent").includes("CherryStudio");
+}
+
+
+/**
+ * Injects system prompts into the request body, including begin token, finish token, and reminder prompts.
+ * Handles systemInstruction compatibility and adds thought chain引导词 if needed.
  * Creates `systemInstruction` if it doesn't exist.
  * @param {object} body - The original request body.
+ * @param {object} config - The worker configuration.
+ * @param {boolean} injectBeginTokenPrompt - Whether to inject the begin token prompt.
+ * @param {boolean} injectFinishTokenPrompt - Whether to inject the finish token prompt.
  * @returns {object} The modified request body.
  */
-export function injectFinishTokenPrompt(body, config) {
+export function injectSystemPrompts(body, config, injectBeginTokenPrompt = true, injectFinishTokenPrompt = true) {
+  logDebug(config && config.debugMode, "Running injectSystemPrompts...", { injectBeginTokenPrompt, injectFinishTokenPrompt });
   // const newBody = JSON.parse(JSON.stringify(body)); // Deep copy
   const newBody = structuredClone(body); // Deep copy
-  const finishTokenPromptPart = { text: FINISH_TOKEN_PROMPT };
 
   // 处理 systemInstruction 和 system_instruction 的兼容性
   normalizeSystemInstruction(newBody);
 
-  if (!newBody.systemInstruction) {
-    logDebug(config && config.debugMode, "Creating new systemInstruction with FINISH_TOKEN_PROMPT");
-    newBody.systemInstruction = { parts: [finishTokenPromptPart] };
-  } else if (!Array.isArray(newBody.systemInstruction.parts)) {
-    logDebug(config && config.debugMode, "Converting systemInstruction.parts to array with FINISH_TOKEN_PROMPT");
-    newBody.systemInstruction.parts = [finishTokenPromptPart];
-  } else if (newBody.systemInstruction.parts.length === 0 || !newBody.systemInstruction.parts[0].text) {
-    // 如果 parts 数组为空，或者第一个 part 没有 text 属性，则设置为第一个part
-    logDebug(config && config.debugMode, "Setting FINISH_TOKEN_PROMPT as first part in systemInstruction");
-    newBody.systemInstruction.parts[0] = finishTokenPromptPart;
-  } else {
-    // 原请求有 systemInstruction.parts 且 parts[0].text 存在
-    // 将 FINISH_TOKEN_PROMPT 追加到原请求的 parts[0].text 里面，加两个换行
-    logDebug(config && config.debugMode, "Appending FINISH_TOKEN_PROMPT to existing systemInstruction");
-    newBody.systemInstruction.parts[0].text += "\n\n---\n" + FINISH_TOKEN_PROMPT;
+  // 构建要注入的提示文本
+  let promptToInject = "";
+  if (injectBeginTokenPrompt && injectFinishTokenPrompt) {
+    // 如果两者都要注入，就直接把finish Token Prompt拼接到begin Token Prompt后面
+    promptToInject = BEGIN_TOKEN_PROMPT + FINISH_TOKEN_PROMPT;
+  } else if (injectBeginTokenPrompt) {
+    promptToInject = BEGIN_TOKEN_PROMPT;
+  } else if (injectFinishTokenPrompt) {
+    promptToInject = FINISH_TOKEN_PROMPT;
   }
 
-  // 处理 contents 中的 model 角色的 parts
+  // 如果没有要注入的提示，直接返回原对象
+  if (!promptToInject) {
+    logDebug(config && config.debugMode, "No token prompts to inject.");
+    return newBody;
+  }
+  logDebug(config && config.debugMode, `Prompt to inject into systemInstruction: "${promptToInject.substring(0, 100)}..."`);
+
+  const tokenPromptPart = { text: promptToInject };
+
+  if (!newBody.systemInstruction) {
+    logDebug(config && config.debugMode, "Creating new systemInstruction with token prompt");
+    newBody.systemInstruction = { parts: [tokenPromptPart] };
+  } else if (!Array.isArray(newBody.systemInstruction.parts)) {
+    logDebug(config && config.debugMode, "Converting systemInstruction.parts to array with token prompt");
+    newBody.systemInstruction.parts = [tokenPromptPart];
+  } else if (newBody.systemInstruction.parts.length === 0 || !newBody.systemInstruction.parts[0].text) {
+    // 如果 parts 数组为空，或者第一个 part 没有 text 属性，则设置为第一个part
+    logDebug(config && config.debugMode, "Setting token prompt as first part in systemInstruction");
+    newBody.systemInstruction.parts[0] = tokenPromptPart;
+  } else {
+    // 原请求有 systemInstruction.parts 且 parts[0].text 存在
+    // 将token prompt追加到原请求的 parts[0].text 里面，加两个换行
+    logDebug(config && config.debugMode, "Appending token prompt to existing systemInstruction");
+    newBody.systemInstruction.parts[0].text += "\n\n---\n" + promptToInject;
+  }
+
+  // 处理 contents 数组中的每个 content
   if (Array.isArray(newBody.contents)) {
     for (const content of newBody.contents) {
-      if (content.role === "model" && Array.isArray(content.parts)) {
-        // 找到最后一个有 text 属性的 part
-        let lastTextPartIndex = -1;
-        for (let i = content.parts.length - 1; i >= 0; i--) {
-          if (content.parts[i].text) {
-            lastTextPartIndex = i;
-            break;
+      if (Array.isArray(content.parts)) {
+        // 根据 injectBeginTokenPrompt 注入 BEGIN_TOKEN
+        if (injectBeginTokenPrompt && content.role === "model") {
+          // 找到第一个有 text 属性的 part
+          let firstTextPartIndex = -1;
+          for (let i = 0; i < content.parts.length; i++) {
+            if (content.parts[i].text) {
+              firstTextPartIndex = i;
+              break;
+            }
+          }
+
+          // 如果找到了，就在其开头注入 BEGIN_TOKEN 和换行
+          if (firstTextPartIndex !== -1) {
+            logDebug(config && config.debugMode, "Injecting BEGIN_TOKEN into model message part.");
+            content.parts[firstTextPartIndex].text = BEGIN_TOKEN + "\n" + content.parts[firstTextPartIndex].text;
           }
         }
 
-        // 如果找到了有 text 属性的 part，则在最后一个 text part 后面添加 FINISHED_TOKEN
-        if (lastTextPartIndex !== -1) {
-          content.parts[lastTextPartIndex].text += "\n" + FINISHED_TOKEN;
+        // 根据 injectFinishTokenPrompt 并且角色为 "model" 时注入 FINISHED_TOKEN
+        if (injectFinishTokenPrompt && content.role === "model") {
+          // 找到最后一个有 text 属性的 part
+          let lastTextPartIndex = -1;
+          for (let i = content.parts.length - 1; i >= 0; i--) {
+            if (content.parts[i].text) {
+              lastTextPartIndex = i;
+              break;
+            }
+          }
+
+          // 如果找到了，就在其末尾添加换行和 FINISHED_TOKEN
+          if (lastTextPartIndex !== -1) {
+            logDebug(config && config.debugMode, "Injecting FINISHED_TOKEN into model message part.");
+            content.parts[lastTextPartIndex].text += "\n" + FINISHED_TOKEN;
+          }
         }
       }
     }
@@ -99,14 +315,33 @@ export function injectFinishTokenPrompt(body, config) {
 
       // 如果找到了含有非空text的对象，则把REMINDER_PROMPT加进去
       if (lastTextPartIndex !== -1) {
-        logDebug(config && config.debugMode, "Adding REMINDER_PROMPT to the last user message");
+        logDebug(config.debugMode, "Adding REMINDER_PROMPT to the last user message");
         lastContent.parts[lastTextPartIndex].text += "\n\n---\n" + REMINDER_PROMPT;
+
       }
+      if (lastTextPartIndex == -1) {
+        logDebug(config.debugMode, "creating a user message of REMINDER_PROMPT");
+        lastContent.parts.push({ text: REMINDER_PROMPT });
+      }
+      // 加入真实思维链引导词
+      if (injectBeginTokenPrompt) {
+        logDebug(config.debugMode, "Injecting START_OF_THOUGHT as a new model message.");
+        newBody.contents.push({ role: "model", parts: [{ text: config.startOfThought }] });
+      }
+    }
+    else {
+      logDebug(config.debugMode, "role of last content is not \"user\"");
     }
   }
 
   return newBody;
 }
+
+// 这个函数会转义所有正则表达式的特殊字符
+function escapeRegExp(string) {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // $& 表示匹配到的整个字符串
+}
+
 
 /**
  * Checks if a response text is complete by verifying it ends with the FINISHED_TOKEN.
@@ -114,63 +349,91 @@ export function injectFinishTokenPrompt(body, config) {
  * @returns {boolean} True if the response is complete.
  */
 export function isResponseComplete(text) {
-  return text.trim().endsWith(FINISHED_TOKEN);
+  const escapedFinishedToken = escapeRegExp(FINISHED_TOKEN);
+  const regex = new RegExp(`${escapedFinishedToken}\\s*$`);
+  return regex.test(text);
 }
 
-// 这个函数会转义所有正则表达式的特殊字符
-function escapeRegExp(string) {
-  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // $& 表示匹配到的整个字符串
-}
 /**
- * Removes the FINISHED_TOKEN and any preceding newline from the final text.
+ * Checks if the formal response has started by looking for the BEGIN_TOKEN.
+ * This signifies the end of the 'thought' phase.
+ * @param {string} text - The response text.
+ * @returns {boolean} True if the formal response has started.
+ */
+export function isFormalResponseStarted(text) {
+  const escapedBeginToken = escapeRegExp(BEGIN_TOKEN);
+  const regex = new RegExp(`^${escapedBeginToken}($|[^\`\. ])`);
+  return regex.test(text);
+}
+
+
+/**
+ * Removes the BEGIN_TOKEN and the FINISHED_TOKEN from the final text.
  * @param {string} text - The complete response text.
+ * @param {boolean} cleanBeginToken - Whether to clean the BEGIN_TOKEN. Defaults to true.
+ * @param {boolean} cleanFinishToken - Whether to clean the FINISHED_TOKEN. Defaults to true.
  * @returns {string} The cleaned text.
  */
-export function cleanFinalText(text) {
-  // Only replace the final FINISHED_TOKEN and its surrounding whitespace, preserving leading whitespace.
-  const escapedToken = escapeRegExp(FINISHED_TOKEN);
-  return text.replace(new RegExp(`\\s?${escapedToken}\\s*$`), "");
+export function cleanFinalText(text, cleanBeginToken = true, cleanFinishToken = true) {
+  let cleanedText = text;
+
+  // 1. 清理开头的 BEGIN_TOKEN
+  if (cleanBeginToken) {
+    const escapedBeginToken = escapeRegExp(BEGIN_TOKEN);
+    cleanedText = cleanedText.replace(new RegExp(`^\\s?${escapedBeginToken}\\s?`), "");
+  }
+
+  // 2. 清理末尾的 FINISHED_TOKEN
+  if (cleanFinishToken) {
+    const escapedFinishedToken = escapeRegExp(FINISHED_TOKEN);
+    cleanedText = cleanedText.replace(new RegExp(`\\s?${escapedFinishedToken}\\s*$`), "");
+  }
+
+  return cleanedText;
 }
 
 /**
  * Builds a new request body for a retry attempt.
- * @param {object} currentBody - The current request body (already processed by injectFinishTokenPrompt).
+ * @param {object} currentBody - The current request body (already processed by injectSystemPrompts).
  * @param {string} accumulatedText - The text generated so far.
  * @returns {object} The new request body for the retry.
  */
-export function buildRetryRequest(currentBody, accumulatedText) {
-
-  if (accumulatedText.length <= FINISHED_TOKEN.length) {
-    return currentBody;
-  }
-  // const newBody = JSON.parse(JSON.stringify(currentBody));
+export function buildRetryRequest(currentBody, newResponseText) {
   const newBody = structuredClone(currentBody);
-
-  // 处理 systemInstruction 和 system_instruction 的兼容性
   normalizeSystemInstruction(newBody);
 
-  const modelResponsePart = {
-    role: "model",
-    parts: [{ text: accumulatedText }],
-  };
+  if (!Array.isArray(newBody.contents)) {
+    newBody.contents = []; // Ensure contents is an array
+  }
 
-  const userRetryPromptPart = {
-    role: "user",
-    parts: [{ text: RETRY_PROMPT }],
-  };
+  const lastContent = newBody.contents.length > 0 ? newBody.contents[newBody.contents.length - 1] : null;
 
-  // Find the last user message and insert the retry context after it.
-  if (Array.isArray(newBody.contents)) {
-    const lastUserIndex = newBody.contents.map(c => c.role).lastIndexOf("user");
-    if (lastUserIndex !== -1) {
-      newBody.contents.splice(lastUserIndex + 1, 0, modelResponsePart, userRetryPromptPart);
+  if (lastContent && lastContent.role === "model") {
+    // Last message is from the model, so append the text.
+    if (!Array.isArray(lastContent.parts) || lastContent.parts.length === 0) {
+      // If parts array is empty or doesn't exist, create it with the new text.
+      lastContent.parts = [{ text: newResponseText }];
     } else {
-      // If no user message, just append to the end.
-      newBody.contents.push(modelResponsePart, userRetryPromptPart);
+      // Find the last part that has a 'text' property to append to.
+      let lastTextPart = null;
+      for (let i = lastContent.parts.length - 1; i >= 0; i--) {
+        if (lastContent.parts[i].hasOwnProperty('text')) {
+          lastTextPart = lastContent.parts[i];
+          break;
+        }
+      }
+
+      if (lastTextPart) {
+        // Append newResponseText to the existing text, ensuring it's a string.
+        lastTextPart.text = (lastTextPart.text || "") + newResponseText;
+      } else {
+        // If no text part exists in a non-empty parts array, add a new one.
+        lastContent.parts.push({ text: newResponseText });
+      }
     }
   } else {
-    // If no contents, just create it.
-    newBody.contents = [modelResponsePart, userRetryPromptPart];
+    // Last message is not from the model (or contents is empty), so add a new model message.
+    newBody.contents.push({ role: "model", parts: [{ text: newResponseText }] });
   }
 
   return newBody;

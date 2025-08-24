@@ -12,7 +12,10 @@ enabled = true
 UPSTREAM_URL_BASE = "https://<你的gptload地址>/proxy/gemini"
 
 # 单次请求的最大重试次数 (可选, 默认为 10)
-MAX_RETRIES = 20
+MAX_RETRIES = 50
 
 # 调试模式 (可选, 默认为 true)
 DEBUG_MODE = "true"
+
+# 思维链引导词 (可选, 默认为 "Here's a")
+START_OF_THOUGHT = "Here's a thinking"

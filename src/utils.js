@@ -10,8 +10,9 @@
 export function parseConfig(env) {
   return {
     upstreamUrlBase: env.UPSTREAM_URL_BASE || "https://generativelanguage.googleapis.com",
-    maxRetries: parseInt(env.MAX_RETRIES, 10) || 3,
+    maxRetries: Math.min(parseInt(env.MAX_RETRIES, 10) || 10, 48),
     debugMode: env.DEBUG_MODE === "true",
+    startOfThought: env.START_OF_THOUGHT || "Here's a thinking",
   };
 }
 
@@ -55,11 +56,11 @@ export function jsonError(status, message, details = null) {
  * @returns {Response} A Response object with CORS headers.
  */
 export function handleOptionsRequest() {
-    return new Response(null, {
-        headers: {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Goog-Api-Key",
-        },
-    });
+  return new Response(null, {
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Goog-Api-Key",
+    },
+  });
 }

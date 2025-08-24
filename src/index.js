@@ -20,6 +20,14 @@ export default {
 
     try {
       const url = new URL(request.url);
+
+      // Handle OPTIONS requests without API key check
+      if (request.method === "OPTIONS") {
+        logDebug(config.debugMode, "Handling OPTIONS preflight request.");
+        return handleOptionsRequest();
+      }
+
+      // Check API key for all other request methods
       const apiKey = url.searchParams.get('key') || request.headers.get('X-Goog-Api-Key');
 
       if (!apiKey) {
@@ -27,15 +35,10 @@ export default {
         return jsonError(403, "Forbidden", "Gemini API key not detected");
       }
 
-      if (request.method === "OPTIONS") {
-        logDebug(config.debugMode, "Handling OPTIONS preflight request.");
-        return handleOptionsRequest();
-      }
-
       // Only POST requests are processed by the anti-truncation logic
       if (request.method === "POST") {
         const isStream = url.pathname.includes(":stream") || url.searchParams.get("alt") === "sse";
-        
+
         logDebug(config.debugMode, `Request identified as ${isStream ? "streaming" : "non-streaming"}.`);
 
         if (isStream) {

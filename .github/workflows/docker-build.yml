@@ -34,7 +34,7 @@ jobs:
         with:
           images: ${{ secrets.DOCKERHUB_USERNAME }}/gemini-antiblock
           tags: |
-            type=raw,value=develop
+            type=raw,value=gat_dev
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v4

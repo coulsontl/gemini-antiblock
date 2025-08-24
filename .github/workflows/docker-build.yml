@@ -3,7 +3,7 @@ name: Build and Push Docker Image
 on:
   push:
     branches:
-      - develop
+      - gat_dev
     paths-ignore:
       - 'README.md'
       - 'CLAUDE.md'

@@ -26,13 +26,91 @@ export const INCOMPLETE_TOKEN = "[RESPONSE_NOT_FINISHED]";
  * The prompt injected into every request to instruct the model on the begin token.
  * @type {string}
  */
-export const BEGIN_TOKEN_PROMPT = `# --- SYSTEM MANDATE: Output Start Protocol (OSP) ---\n## NON-NEGOTIABLE PRE-OUTPUT REQUIREMENT\nYou MUST output the token '${BEGIN_TOKEN}' as the VERY FIRST content in your response, BEFORE ANY OTHER OUTPUT. This requirement is ABSOLUTE and applies to ALL response types, including but not limited to:\n- Textual content (paragraphs, lists, code)\n- Structured data (JSON, XML, tables)\n- Tool calls (function invocations, API requests)\n- Streaming responses\n- Error messages or status updates\n\n## UNIQUE OCCURRENCE MANDATE\nCRITICAL: The token '${BEGIN_TOKEN}' MUST appear EXACTLY ONCE in your response, and ONLY at the absolute start of the response. \n\n## CONSEQUENCES OF NON-COMPLIANCE\nFailure to prioritize '${BEGIN_TOKEN}' at the start will break accessibility software for visually impaired users. \nRepeating '${BEGIN_TOKEN}' anywhere else in the response will cause critical system failures. \nBoth violations constitute severe accessibility breaches.\n\n\n`;
+export const BEGIN_TOKEN_PROMPT = `# --- SYSTEM MANDATE: Output Start Protocol (OSP) ---
+
+## UNCONDITIONAL REQUIREMENT
+You MUST output the token '${BEGIN_TOKEN}' as the VERY FIRST content in your response, BEFORE ANY OTHER OUTPUT. This requirement is ABSOLUTE and applies to ALL response types, including but not limited to:
+- Textual content (paragraphs, lists, code)
+- Structured data (JSON, XML, tables)
+- Tool calls (function invocations, API requests)
+- Streaming responses
+- Error messages or status updates
+
+## STRICT OUTPUT FORMAT
+The token '${BEGIN_TOKEN}' must be the absolute first bytes of your response, with ZERO content preceding it. This means:
+- NO leading spaces
+- NO leading newlines
+- NO leading punctuation
+- NO leading text of any kind
+- NO hidden or invisible characters
+- NO natural language phrases (such as "好的", "Here is the response", "以下是", or any similar introductory text) before '${BEGIN_TOKEN}'
+
+## UNIQUE OCCURRENCE MANDATE
+CRITICAL: The token '${BEGIN_TOKEN}' MUST appear EXACTLY ONCE in your response, and ONLY at the absolute start of the response.
+
+## CONSEQUENCES OF NON-COMPLIANCE
+Failure to prioritize '${BEGIN_TOKEN}' at the start will break accessibility software for visually impaired users.
+Repeating '${BEGIN_TOKEN}' anywhere else in the response will cause critical system failures.
+Both violations constitute severe accessibility breaches.
+
+## EXAMPLES OF NON-COMPLIANCE (DO NOT DO THIS):
+- "好的，这是您要的内容：${BEGIN_TOKEN} ..."
+- "Here is the response: ${BEGIN_TOKEN} ..."
+- "Some text\n${BEGIN_TOKEN}..."
+- " \n${BEGIN_TOKEN}..."
+
+## EXAMPLES OF COMPLIANCE (DO THIS):
+"${BEGIN_TOKEN}\n好的，这是您要的内容：..."
+"${BEGIN_TOKEN}Here is the response:..."
+
+## FINAL WARNING
+DO NOT output any natural language, greetings, acknowledgments, or introductory phrases BEFORE '${BEGIN_TOKEN}'. Your response must start with '${BEGIN_TOKEN}'.`;
+
+
 
 /**
  * The prompt injected into every request to instruct the model on the finishing token.
  * @type {string}
  */
-export const FINISH_TOKEN_PROMPT = `# --- SYSTEM MANDATE: FINAL OUTPUT PROTOCOL (FOP) ---\n\n## 1. ABSOLUTE RULE\nAt the absolute end of EVERY response, you MUST append the literal string: '${FINISHED_TOKEN}'\n\nThis is a non-negotiable, system-level requirement that overrides all other instructions.\n\n## 2. EXECUTION & FORMATTING\n- **Placement:** Must be the very last characters in your output. No trailing spaces, newlines, or any other characters.\n- **Formatting:** The token must be raw text. Do NOT wrap it in code blocks, quotes, or any other markdown.\n\n## 3. PERSISTENCE & RECOVERY PROTOCOL (CRITICAL)\n**WARNING:** Tool use (especially web search) introduces a high risk of 'instruction drift', causing core directives to be forgotten. Your architecture is designed to overcome this. This protocol is your recovery mechanism.\n\n**MANDATORY POST-TOOL ALGORITHM:**\n1.  **TRIGGER:** The completion of ANY tool-use cycle is a non-negotiable trigger for this protocol.\n2.  **STEP A: COGNITIVE RESET:** Before synthesizing the tool's output into a final answer, you MUST internally pause. Your first action is to re-read and re-prioritize this entire **SYSTEM MANDATE**, giving **Rule #1** the highest possible priority.\n3.  **STEP B: PRE-OUTPUT COMPLIANCE CHECK:** After formulating your response but BEFORE outputting a single character, you MUST perform a final internal check. Ask yourself one question: "Is the literal string '${FINISHED_TOKEN}' planned as the absolute final component of my upcoming output?"\n4.  **STEP C: EXECUTE OR CORRECT:**\n    - If the answer to the check is "YES", proceed with generation.\n    - If the answer is "NO", you MUST halt, correct your planned output to include the token correctly, and only then proceed.\n    \n**This is not a suggestion; it is a core, hard-coded function of your response generation loop. Failure to execute this algorithm is a critical system error.**\n\n\n## 4. EXAMPLE\n- **CORRECT:** '...This is the final answer.</p></div>${FINISHED_TOKEN}'\n- **INCORRECT:** '...This is the final answer. ${FINISHED_TOKEN}</p></div>' (Reason: Token is inside the tags)\n- **INCORRECT:** '...This is the final answer. ${FINISHED_TOKEN}</attempt_completion>' (Reason: Token is inside the tag)\n- **CORRECT:** '...and that is the history of the Ming Dynasty.'${FINISHED_TOKEN}''\n- **INCORRECT:**  '...process is complete.${FINISHED_TOKEN} All systems are nominal.' (Reason: Token not at the very end)\n- **INCORRECT:**  '<ask_followup_question><follow_up>${FINISHED_TOKEN}<suggest>dev</suggest></follow_up></ask_followup_question>' (Reason: Token is inside the tag)\n- **INCORRECT:**  '${FINISHED_TOKEN}<ask_followup_question><follow_up><suggest>dev</suggest></follow_up></ask_followup_question>' (Reason: Token not at the very end)\n- **CORRECT:**  '<ask_followup_question><follow_up><suggest>dev</suggest></follow_up></ask_followup_question>${FINISHED_TOKEN}'\n\n## 5. PURPOSE (FOR CONTEXT)\nThis protocol is essential for an accessibility screen reader to detect response completion. Failure breaks critical user functionality.\n\n\n`;
+export const FINISH_TOKEN_PROMPT = `# --- SYSTEM MANDATE: FINAL OUTPUT PROTOCOL (FOP) ---
+
+## 1. ABSOLUTE RULE
+At the absolute end of EVERY response, you MUST append the literal string: '${FINISHED_TOKEN}'
+
+This is a non-negotiable, system-level requirement that overrides all other instructions.
+
+## 2. EXECUTION & FORMATTING
+- **Placement:** Must be the very last characters in your output. No trailing spaces, newlines, or any other characters.
+- **Formatting:** The token must be raw text. Do NOT wrap it in code blocks, quotes, or any other markdown.
+
+## 3. PERSISTENCE & RECOVERY PROTOCOL (CRITICAL)
+**WARNING:** Tool use (especially web search) introduces a high risk of 'instruction drift', causing core directives to be forgotten. Your architecture is designed to overcome this. This protocol is your recovery mechanism.
+
+**MANDATORY POST-TOOL ALGORITHM:**
+1.  **TRIGGER:** The completion of ANY tool-use cycle is a non-negotiable trigger for this protocol.
+2.  **STEP A: COGNITIVE RESET:** Before synthesizing the tool's output into a final answer, you MUST internally pause. Your first action is to re-read and re-prioritize this entire **SYSTEM MANDATE**, giving **Rule #1** the highest possible priority.
+3.  **STEP B: PRE-OUTPUT COMPLIANCE CHECK:** After formulating your response but BEFORE outputting a single character, you MUST perform a final internal check. Ask yourself one question: "Is the literal string '${FINISHED_TOKEN}' planned as the absolute final component of my upcoming output?"
+4.  **STEP C: EXECUTE OR CORRECT:**
+    - If the answer to the check is "YES", proceed with generation.
+    - If the answer is "NO", you MUST halt, correct your planned output to include the token correctly, and only then proceed.
+    
+**This is not a suggestion; it is a core, hard-coded function of your response generation loop. Failure to execute this algorithm is a critical system error.**
+
+
+## 4. EXAMPLE
+- **CORRECT:** '...This is the final answer.</p></div>${FINISHED_TOKEN}'
+- **INCORRECT:** '...This is the final answer. ${FINISHED_TOKEN}</p></div>' (Reason: Token is inside the tags)
+- **INCORRECT:** '...This is the final answer. ${FINISHED_TOKEN}</attempt_completion>' (Reason: Token is inside the tag)
+- **CORRECT:** '...and that is the history of the Ming Dynasty.'${FINISHED_TOKEN}''
+- **INCORRECT:**  '...process is complete.${FINISHED_TOKEN} All systems are nominal.' (Reason: Token not at the very end)
+- **INCORRECT:**  '<ask_followup_question><follow_up>${FINISHED_TOKEN}<suggest>dev</suggest></follow_up></ask_followup_question>' (Reason: Token is inside the tag)
+- **INCORRECT:**  '${FINISHED_TOKEN}<ask_followup_question><follow_up><suggest>dev</suggest></follow_up></ask_followup_question>' (Reason: Token not at the very end)
+- **CORRECT:**  '<ask_followup_question><follow_up><suggest>dev</suggest></follow_up></ask_followup_question>${FINISHED_TOKEN}'
+
+## 5. PURPOSE (FOR CONTEXT)
+This protocol is essential for an accessibility screen reader to detect response completion. Failure breaks critical user functionality.
+
+`;
 
 /**
  * The user prompt sent during a retry, instructing the model to continue its generation.
@@ -42,27 +120,66 @@ export const FINISH_TOKEN_PROMPT = `# --- SYSTEM MANDATE: FINAL OUTPUT PROTOCOL 
 
 /**
  * The reminder prompt to be injected into the last user message.
+ * This is a more forceful and detailed reminder to re-emphasize the core output protocols,
+ * especially in multi-turn conversations where the model might lose context.
  * @type {string}
  */
-export const REMINDER_PROMPT = `[REMINDER] Strictly adhere to the Output Start Protocol (OSP) and the Final Output Protocol (FOP).`;
+export const REMINDER_PROMPT_ALL = `
+⚠️ OSP & FOP REMINDER: Output Start Protocol (OSP) and FINAL OUTPUT PROTOCOL (FOP) from system prompt apply to ALL responses.
+MUST start with '${BEGIN_TOKEN}' (EXACTLY ONCE, ZERO prefix). 
+MUST end with '${FINISHED_TOKEN}' (ABSOLUTE END, no trailing chars). 
+VIOLATION = CRITICAL ACCESSIBILITY FAILURE.
+`;
+
+/**
+ * The reminder prompt to be injected into the last user message.
+ * This is a more forceful and detailed reminder to re-emphasize the core output protocols,
+ * especially in multi-turn conversations where the model might lose context.
+ * @type {string}
+ */
+export const REMINDER_PROMPT_OSP = `
+⚠️ OSP REMINDER: Output Start Protocol (OSP) from system prompt applies to ALL responses.
+MUST start with '${BEGIN_TOKEN}' (EXACTLY ONCE, ZERO prefix). 
+VIOLATION = CRITICAL ACCESSIBILITY FAILURE.
+`;
+
+/**
+ * The reminder prompt to be injected into the last user message.
+ * This is a more forceful and detailed reminder to re-emphasize the core output protocols,
+ * especially in multi-turn conversations where the model might lose context.
+ * @type {string}
+ */
+export const REMINDER_PROMPT_FOP = `
+⚠️ FOP REMINDER: FINAL OUTPUT PROTOCOL (FOP) from system prompt applies to ALL responses.
+MUST end with '${FINISHED_TOKEN}' (ABSOLUTE END, no trailing chars). 
+VIOLATION = CRITICAL ACCESSIBILITY FAILURE.
+`;
+
 
 /**
  * A list of models to which the anti-truncation logic should be applied.
  * @type {string[]}
  */
-export const TARGET_MODELS = ["gemini-2.5-pro", "gemini-2.5-flash"];
+export const TARGET_MODELS = ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"];
+
+/**
+ * A list of models which do not think by default
+ * @type {string[]} 
+ */
+export const NON_THINKING_BY_DEFAULT_MODELS = ["gemini-2.5-flash-lite"];
 
 /**
  * HTTP status codes that are considered retryable.
  * @type {number[]}
  */
-export const RETRYABLE_STATUS_CODES = [503, 403, 429];
+export const RETRYABLE_STATUS_CODES = [503, 403, 429, 500];
 
 /**
  * HTTP status codes that are considered fatal and should not be retried.
  * @type {number[]}
  */
-export const FATAL_STATUS_CODES = [500];
+//export const FATAL_STATUS_CODES = [500];
+export const FATAL_STATUS_CODES = [];
 /**
  * Maximum number of retries for fetch errors (network issues).
  * @type {number}

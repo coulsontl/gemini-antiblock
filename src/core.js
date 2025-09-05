@@ -2,7 +2,7 @@
  * @fileoverview Core logic for request modification, validation, and retry preparation.
  */
 
-import { BEGIN_TOKEN_PROMPT, FINISH_TOKEN_PROMPT, REMINDER_PROMPT, BEGIN_TOKEN, FINISHED_TOKEN } from "./constants.js";
+import { BEGIN_TOKEN_PROMPT, FINISH_TOKEN_PROMPT, REMINDER_PROMPT_ALL, REMINDER_PROMPT_OSP, REMINDER_PROMPT_FOP, BEGIN_TOKEN, FINISHED_TOKEN, INCOMPLETE_TOKEN } from "./constants.js";
 import { logDebug } from "./utils.js";
 
 /**
@@ -199,6 +199,24 @@ export function isCherryRequest(body) {
   return body.headers.has("User-Agent") && body.headers.get("User-Agent").includes("CherryStudio");
 }
 
+/**
+ * 
+ * @param {*} pathname 
+ * @returns {*[]}
+ */
+export function getModelThinkingBudgetRange(pathname) {
+  let modelThinkingBudgetRange = [512, 24576];
+  if (pathname.toLowerCase().includes("gemini-2.5-flash-lite")) {
+    modelThinkingBudgetRange = [512, 24576];
+  }
+  else if (pathname.toLowerCase().includes("gemini-2.5-flash")) {
+    modelThinkingBudgetRange = [1, 24576];
+  }
+  else if (pathname.toLowerCase().includes("gemini-2.5-pro")) {
+    modelThinkingBudgetRange = [128, 32768];
+  }
+  return modelThinkingBudgetRange;
+}
 
 /**
  * Injects system prompts into the request body, including begin token, finish token, and reminder prompts.
@@ -272,8 +290,13 @@ export function injectSystemPrompts(body, config, injectBeginTokenPrompt = true,
 
           // 如果找到了，就在其开头注入 BEGIN_TOKEN 和换行
           if (firstTextPartIndex !== -1) {
-            logDebug(config && config.debugMode, "Injecting BEGIN_TOKEN into model message part.");
-            content.parts[firstTextPartIndex].text = BEGIN_TOKEN + "\n" + content.parts[firstTextPartIndex].text;
+            if (!content.parts[firstTextPartIndex].text.trim().startsWith(BEGIN_TOKEN)) {
+              content.parts[firstTextPartIndex].text = BEGIN_TOKEN + "\n" + content.parts[firstTextPartIndex].text;
+              logDebug(config.debugMode, "Injecting BEGIN_TOKEN into model message part.");
+            }
+            else {
+              logDebug(config.debugMode, "BEGIN_TOKEN already exists in model message part.");
+            }
           }
         }
 
@@ -290,8 +313,13 @@ export function injectSystemPrompts(body, config, injectBeginTokenPrompt = true,
 
           // 如果找到了，就在其末尾添加换行和 FINISHED_TOKEN
           if (lastTextPartIndex !== -1) {
-            logDebug(config && config.debugMode, "Injecting FINISHED_TOKEN into model message part.");
-            content.parts[lastTextPartIndex].text += "\n" + FINISHED_TOKEN;
+            if (!content.parts[lastTextPartIndex].text.trim().endsWith(INCOMPLETE_TOKEN)) {
+              logDebug(config.debugMode, "Injecting FINISHED_TOKEN into model message part.");
+              content.parts[lastTextPartIndex].text += "\n" + FINISHED_TOKEN;
+            }
+            else {
+              logDebug(config.debugMode, "Skipping FINISHED_TOKEN injection into model message part because it is incomplete.");
+            }
           }
         }
       }
@@ -311,6 +339,17 @@ export function injectSystemPrompts(body, config, injectBeginTokenPrompt = true,
           lastTextPartIndex = i;
           break;
         }
+      }
+
+      let REMINDER_PROMPT = "";
+      if (injectBeginTokenPrompt && injectFinishTokenPrompt) {
+        REMINDER_PROMPT = REMINDER_PROMPT_ALL;
+      }
+      else if (injectBeginTokenPrompt) {
+        REMINDER_PROMPT = REMINDER_PROMPT_OSP;
+      }
+      else if (injectFinishTokenPrompt) {
+        REMINDER_PROMPT = REMINDER_PROMPT_FOP;
       }
 
       // 如果找到了含有非空text的对象，则把REMINDER_PROMPT加进去
@@ -362,7 +401,22 @@ export function isResponseComplete(text) {
  */
 export function isFormalResponseStarted(text) {
   const escapedBeginToken = escapeRegExp(BEGIN_TOKEN);
-  const regex = new RegExp(`^${escapedBeginToken}($|[^\`\. ])`);
+  // const regex = new RegExp(`^${escapedBeginToken}($|[^\`\. ])`);
+  //return regex.test(text);
+  const regex = new RegExp(`(?<!\`)${escapedBeginToken}`);
+  const matches = text.match(regex);
+  return matches !== null && matches.length === 1;
+}
+
+/**
+ * Checks if the formal response has started by looking for the BEGIN_TOKEN.
+ * This signifies the end of the 'thought' phase.
+ * @param {string} text - The response text.
+ * @returns {boolean} True if the formal response has started.
+ */
+export function isFormalResponseStarted_nonStream(text) {
+  const escapedBeginToken = escapeRegExp(BEGIN_TOKEN);
+  const regex = new RegExp(`^${escapedBeginToken}`);
   return regex.test(text);
 }
 
@@ -399,8 +453,12 @@ export function cleanFinalText(text, cleanBeginToken = true, cleanFinishToken = 
  * @returns {object} The new request body for the retry.
  */
 export function buildRetryRequest(currentBody, newResponseText) {
-  const newBody = structuredClone(currentBody);
+  // const newBody = structuredClone(currentBody);
+  const newBody = currentBody;
   normalizeSystemInstruction(newBody);
+  if (newResponseText.length == 0) {
+    return newBody;
+  }
 
   if (!Array.isArray(newBody.contents)) {
     newBody.contents = []; // Ensure contents is an array

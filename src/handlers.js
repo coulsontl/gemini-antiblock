@@ -3,20 +3,23 @@
  */
 
 import {
+  BEGIN_TOKEN,
   FINISHED_TOKEN,
   INCOMPLETE_TOKEN,
   TARGET_MODELS,
+  NON_THINKING_BY_DEFAULT_MODELS,
   RETRYABLE_STATUS_CODES,
   FATAL_STATUS_CODES,
   MAX_FETCH_RETRIES,
-  MAX_NON_RETRYABLE_STATUS_RETRIES,
-  // BEGIN_TOKEN
+  MAX_NON_RETRYABLE_STATUS_RETRIES
 } from "./constants.js";
 import {
   isCherryRequest,
   injectSystemPrompts,
   isResponseComplete,
   isFormalResponseStarted,
+  isFormalResponseStarted_nonStream,
+  getModelThinkingBudgetRange,
   cleanFinalText,
   buildRetryRequest,
   buildUpstreamRequest,
@@ -25,7 +28,14 @@ import {
   createWrappedFetch,
   // processSSEDataLine,
 } from "./core.js";
-import { logDebug, jsonError } from "./utils.js";
+import { logDebug } from "./utils.js";
+
+
+function sleep(ms) {
+  return new Promise(resolve => {
+    setTimeout(resolve, ms);
+  });
+}
 
 // 创建包装后的 fetch 函数
 const wrappedFetch = createWrappedFetch(fetch);
@@ -39,6 +49,8 @@ const wrappedFetch = createWrappedFetch(fetch);
  */
 export async function handleNonStreamingRequest(request, config, url) {
   const isTargetModel = TARGET_MODELS.some(model => url.pathname.includes(`models/${model}:generateContent`));
+  const isNonThinkingByDefaultModel = NON_THINKING_BY_DEFAULT_MODELS.some(model => url.pathname.includes(`models/${model}:generateContent`));
+  const isLiteModel = url.pathname.toLowerCase().includes(`flash-lite`);
 
   if (!isTargetModel) {
     logDebug(config.debugMode, "Passing through non-streaming request without modification.");
@@ -59,7 +71,7 @@ export async function handleNonStreamingRequest(request, config, url) {
   }
 
   // 处理 thinkingBudget
-  let injectBeginTokenPrompt = true;
+  let injectBeginTokenPrompt = !isNonThinkingByDefaultModel;
   let originalThinkingBudget = originalRequestBody.generationConfig?.thinkingConfig?.thinkingBudget;
 
   // 检查 thinkingBudget 是否存在且为0
@@ -67,18 +79,20 @@ export async function handleNonStreamingRequest(request, config, url) {
     injectBeginTokenPrompt = false;
   }
 
-  // 如果 thinkingBudget 存在且不为0，将其规范在128-32768之间
-  if (originalThinkingBudget !== undefined && originalThinkingBudget !== 0) {
-    if (originalThinkingBudget < 128) {
-      originalRequestBody.generationConfig.thinkingConfig.thinkingBudget = 128;
-    } else if (originalThinkingBudget > 32768) {
-      originalRequestBody.generationConfig.thinkingConfig.thinkingBudget = 32768;
+  // 如果 thinkingBudget 存在且大于0，将其规范允许范围之内;设置injectBeginTokenPrompt为true
+  if (originalThinkingBudget !== undefined && originalThinkingBudget > 0) {
+    injectBeginTokenPrompt = true;
+    let modelThinkingBudgetRange = getModelThinkingBudgetRange(url.pathname);
+    if (originalThinkingBudget < modelThinkingBudgetRange[0]) {
+      originalRequestBody.generationConfig.thinkingConfig.thinkingBudget = modelThinkingBudgetRange[0];
+    } else if (originalThinkingBudget > modelThinkingBudgetRange[1]) {
+      originalRequestBody.generationConfig.thinkingConfig.thinkingBudget = modelThinkingBudgetRange[1];
     }
   }
 
   // 是否输出思维链
   let originalIncludeThoughts = originalRequestBody.generationConfig?.thinkingConfig?.includeThoughts;
-  let isIncludeThoughts = originalIncludeThoughts !== undefined ? originalIncludeThoughts : true;
+  let isIncludeThoughts = (originalIncludeThoughts !== undefined ? originalIncludeThoughts : false) && injectBeginTokenPrompt;
 
 
 
@@ -91,6 +105,7 @@ export async function handleNonStreamingRequest(request, config, url) {
 
   while (attempts <= config.maxRetries) {
     attempts++;
+    let accumulatedTextThisAttempt = "";
     logDebug(config.debugMode, `Non-streaming attempt ${attempts}/${config.maxRetries + 1}`);
 
     const upstreamUrl = `${config.upstreamUrlBase}${url.pathname}${url.search}`;
@@ -107,26 +122,48 @@ export async function handleNonStreamingRequest(request, config, url) {
 
         // Check if response contains function call
         let hasFunctionCall = false;
-        let partsText = "";
+        let hasFunctionCallParts = [];
+        let thoughtAccumulatedTextWithFunctionCall = thoughtAccumulatedText;
+        let formalAccumulatedTextWithFunctionCall = formalAccumulatedText;
+        let isThoughtFinishedWithFunctionCall = isThoughtFinished;
         for (const part of parts) {
           if (part.functionCall) {
             hasFunctionCall = true;
+            hasFunctionCallParts.push(part);
             // break;
           }
-          if (hasFunctionCall && !part.functionCall) {
-            partsText += part.text;
-            part.text = "";
+          else {
+            if (part.text && !part.thought) {
+              if (!isThoughtFinishedWithFunctionCall && !isFormalResponseStarted_nonStream(part.text)) {
+                thoughtAccumulatedTextWithFunctionCall += part.text;
+              }
+              else if (!isThoughtFinishedWithFunctionCall && isFormalResponseStarted_nonStream(part.text)) {
+                formalAccumulatedTextWithFunctionCall += part.text;
+                isThoughtFinishedWithFunctionCall = true;
+              }
+              else {
+                formalAccumulatedTextWithFunctionCall += part.text;
+              }
+            }
           }
         }
-        parts.unshift({ text: cleanFinalText(partsText) });
+
 
         if (hasFunctionCall) {
+          hasFunctionCallParts.unshift({ text: cleanFinalText(formalAccumulatedTextWithFunctionCall) });
+          hasFunctionCallParts.unshift({ text: thoughtAccumulatedTextWithFunctionCall, thought: true });
+          responseJson.candidates[0].content.parts = hasFunctionCallParts;
           logDebug(config.debugMode, "Non-streaming response contains function call. Returning as is.");
           return new Response(JSON.stringify(responseJson), {
             status: 200,
             headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" },
           });
         }
+        else {
+          thoughtAccumulatedTextWithFunctionCall = "";
+          formalAccumulatedTextWithFunctionCall = "";
+        }
+
 
         // Process each part in the parts array
         for (const part of parts) {
@@ -134,7 +171,7 @@ export async function handleNonStreamingRequest(request, config, url) {
           if (part.text && !part.thought) {
             if (!isThoughtFinished) {
               // 思维尚未结束，检查当前text是否标记思维结束
-              if (isFormalResponseStarted(part.text)) {
+              if (isFormalResponseStarted_nonStream(part.text)) {
                 isThoughtFinished = true;
                 // 将当前text添加到正式响应累积文本
                 formalAccumulatedText += part.text;
@@ -146,10 +183,11 @@ export async function handleNonStreamingRequest(request, config, url) {
               // 思维已经结束，在整个非流式处理中接下来收到的都是正式响应文本
               formalAccumulatedText += part.text;
             }
+            accumulatedTextThisAttempt += part.text;
           }
         }
 
-        if (isThoughtFinished && isResponseComplete(formalAccumulatedText)) {
+        if (isThoughtFinished && (isResponseComplete(formalAccumulatedText) || isLiteModel)) {
           logDebug(config.debugMode, "Non-streaming response is complete.");
           // Clean the final text and reconstruct the parts array
           const finalParts = [];
@@ -164,29 +202,42 @@ export async function handleNonStreamingRequest(request, config, url) {
             headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" },
           });
         } else {
-          logDebug(config.debugMode, "Non-streaming response is incomplete. Preparing for retry.");
-          currentRequestBody = buildRetryRequest(currentRequestBody, thoughtAccumulatedText + formalAccumulatedText);
+          logDebug(config.debugMode, "Non-streaming response is incomplete. Preparing for retry. accumulatedTextThisAttempt:", accumulatedTextThisAttempt);
+          currentRequestBody = buildRetryRequest(currentRequestBody, accumulatedTextThisAttempt);
         }
       } else {
+        const errorText = await upstreamResponse.text();
         logDebug(config.debugMode, `Non-streaming attempt ${attempts} failed with status ${upstreamResponse.status}`);
 
         // Check for fatal status codes first
         if (FATAL_STATUS_CODES.includes(upstreamResponse.status)) {
           logDebug(config.debugMode, `Fatal status ${upstreamResponse.status} received. Aborting retries.`);
-          return jsonError(upstreamResponse.status, "Upstream API returned a fatal error.", await upstreamResponse.text());
+          break;
         }
 
-        const isRetryableStatus = RETRYABLE_STATUS_CODES.includes(upstreamResponse.status);
+        let isRetryableStatus = RETRYABLE_STATUS_CODES.includes(upstreamResponse.status);
+        if (attempts <= config.maxRetries && upstreamResponse.status == 429) {
+          if (!errorText.toLowerCase().includes(`"quota_limit_value":"0"`) && !errorText.includes(`GenerateRequestsPerDayPerProjectPerModel`)) {
+            await sleep(500);
+          }
+        }
+        else if (attempts <= config.maxRetries && upstreamResponse.status == 400) {
+          if (errorText.toLowerCase().includes("api key") || errorText.toLowerCase().includes("user location")) {
+            isRetryableStatus = true;
+          }
+        }
         const maxRetriesForThisError = isRetryableStatus ? config.maxRetries : MAX_NON_RETRYABLE_STATUS_RETRIES;
 
         if (attempts > maxRetriesForThisError) {
-          return jsonError(upstreamResponse.status, "Upstream API error after max retries.", await upstreamResponse.text());
+          logDebug(config.debugMode, `Upstream API error after max retries: ${errorText}`);
+          break;
         }
       }
     } catch (error) {
       logDebug(config.debugMode, `Fetch error during non-streaming attempt ${attempts}:`, error);
       if (attempts > MAX_FETCH_RETRIES) {
-        return jsonError(500, "Internal Server Error after max retries.", error.message);
+        logDebug(config.debugMode, `Internal Server Error after max retries.`);
+        break;
       }
     }
   }
@@ -197,7 +248,7 @@ export async function handleNonStreamingRequest(request, config, url) {
   // Construct final response with all accumulated thought parts and incomplete text
   const finalParts = [];
   // Add thought accumulated text if it exists
-  if (injectBeginTokenPrompt && thoughtAccumulatedText) {
+  if (isIncludeThoughts && thoughtAccumulatedText.length > config.startOfThought.length) {
     // thoughtAccumulatedText does not contain BEGIN/FINISHED tokens, so no cleaning needed.
     finalParts.push({ text: thoughtAccumulatedText, thought: true });
   }
@@ -209,7 +260,7 @@ export async function handleNonStreamingRequest(request, config, url) {
       content: {
         parts: finalParts
       },
-      finishReason: "MAX_RETRIES"
+      finishReason: "FXXKED"
     }]
   };
   return new Response(JSON.stringify(finalJson), {
@@ -227,6 +278,8 @@ export async function handleNonStreamingRequest(request, config, url) {
  */
 export async function handleStreamingRequest(request, config, url) {
   const isTargetModel = TARGET_MODELS.some(model => url.pathname.includes(`models/${model}:streamGenerateContent`));
+  const isNonThinkingByDefaultModel = NON_THINKING_BY_DEFAULT_MODELS.some(model => url.pathname.includes(`models/${model}:streamGenerateContent`));
+  const isLiteModel = url.pathname.toLowerCase().includes(`flash-lite`);
 
   if (!isTargetModel) {
     logDebug(config.debugMode, "Passing through streaming request without modification.");
@@ -250,7 +303,7 @@ export async function handleStreamingRequest(request, config, url) {
   let isFromCherryRequest = isCherryRequest(request);
 
   // 处理 thinkingBudget
-  let injectBeginTokenPrompt = true;
+  let injectBeginTokenPrompt = !isNonThinkingByDefaultModel;
   let originalThinkingBudget = originalRequestBody.generationConfig?.thinkingConfig?.thinkingBudget;
 
   // 检查 thinkingBudget 是否存在且为0
@@ -258,18 +311,20 @@ export async function handleStreamingRequest(request, config, url) {
     injectBeginTokenPrompt = false;
   }
 
-  // 如果 thinkingBudget 存在且不为0，将其规范在128-32768之间
-  if (originalThinkingBudget !== undefined && originalThinkingBudget !== 0) {
-    if (originalThinkingBudget < 128) {
-      originalRequestBody.generationConfig.thinkingConfig.thinkingBudget = 128;
-    } else if (originalThinkingBudget > 32768) {
-      originalRequestBody.generationConfig.thinkingConfig.thinkingBudget = 32768;
+  // 如果 thinkingBudget 存在且大于0，将其规范在允许范围之内;设置injectBeginTokenPrompt为true
+  if (originalThinkingBudget !== undefined && originalThinkingBudget > 0) {
+    injectBeginTokenPrompt = true;
+    let modelThinkingBudgetRange = getModelThinkingBudgetRange(url.pathname);
+    if (originalThinkingBudget < modelThinkingBudgetRange[0]) {
+      originalRequestBody.generationConfig.thinkingConfig.thinkingBudget = modelThinkingBudgetRange[0];
+    } else if (originalThinkingBudget > modelThinkingBudgetRange[1]) {
+      originalRequestBody.generationConfig.thinkingConfig.thinkingBudget = modelThinkingBudgetRange[1];
     }
   }
 
   // 是否输出思维链
   let originalIncludeThoughts = originalRequestBody.generationConfig?.thinkingConfig?.includeThoughts;
-  let isIncludeThoughts = originalIncludeThoughts !== undefined ? originalIncludeThoughts : true;
+  let isIncludeThoughts = (originalIncludeThoughts !== undefined ? originalIncludeThoughts : false) && injectBeginTokenPrompt;
 
   logDebug(config.debugMode, "Starting streaming request handler.");
 
@@ -293,13 +348,14 @@ export async function handleStreamingRequest(request, config, url) {
     let textBuffer = ""; // Buffer for lookahead
     let linesBuffer = []; // Buffer of objects: { rawLine, isTransitionLine, text }
     let isFirstOutput = true;
+    let lastSendChar = '';
 
     while (attempts <= config.maxRetries) {
       attempts++;
       logDebug(config.debugMode, `Streaming attempt ${attempts}/${config.maxRetries + 1}`);
 
       let hasGotBeginToken = false;
-      let accumulatedTextThisAttempt = (injectBeginTokenPrompt && isFirstOutput) ? config.startOfThought : ""; // Accumulates all *sent* non-garbage text for retries
+      let accumulatedTextThisAttempt = ""; // Accumulates all *sent* non-garbage text for retries
       let hasFunctionCallInStream = false;
       let passthroughMode = false;
 
@@ -319,7 +375,7 @@ export async function handleStreamingRequest(request, config, url) {
 
           // 添加动态超时机制
           let timeoutId;
-          let lastDataTime = Date.now();
+          // let lastDataTime = Date.now();
           let isFirstData = true; // 标记是否是第一次数据
           const INITIAL_TIMEOUT_DURATION = 20000; // 首次20秒超时
           const SUBSEQUENT_TIMEOUT_DURATION = 4000; // 后续4秒超时
@@ -344,7 +400,8 @@ export async function handleStreamingRequest(request, config, url) {
 
             // 如果超时，则设置done为true并继续处理
             if (result.timeout) {
-              logDebug(config.debugMode, `Stream timeout after ${TIMEOUT_DURATION / 1000} seconds of inactivity. Closing stream.`);
+              const timeoutDuration = isFirstData ? INITIAL_TIMEOUT_DURATION : SUBSEQUENT_TIMEOUT_DURATION;
+              logDebug(config.debugMode, `Stream timeout after ${timeoutDuration / 1000} seconds of inactivity. Closing stream.`);
               result = { value: undefined, done: true };
             }
 
@@ -353,7 +410,7 @@ export async function handleStreamingRequest(request, config, url) {
             // 如果有新数据，则重置超时计时器
             if (value) {
               clearTimeout(timeoutId);
-              lastDataTime = Date.now();
+              // lastDataTime = Date.now();
               // 如果是第一次数据，将isFirstData设置为false，以便后续使用4秒超时
               if (isFirstData) {
                 isFirstData = false;
@@ -399,95 +456,115 @@ export async function handleStreamingRequest(request, config, url) {
                   if (hasFunctionCallInStream && !passthroughMode) {
                     logDebug(config.debugMode, "Function call detected. Switching to passthrough mode.");
                     // Forward all buffered lines immediately
-                    if (linesBuffer.length > 0) {
-                      let lastline = linesBuffer.pop().rawLine;
-                      let lastlineJson = JSON.parse(lastline.substring(5).trim());
-                      lastlineJson.candidates[0].content.parts = { text: cleanFinalText(textBuffer) };
-                      lastline = `data: ${JSON.stringify(lastlineJson)}\n\n`;
-                      writer.write(encoder.encode(lastline + '\n\n'));
-                      linesBuffer = [];
-                      textBuffer = "";
-                      isThoughtFinished = true;
+                    while (linesBuffer.length > 0) {
+                      let lineObj = linesBuffer.shift();
+                      if (lineObj.isTransitionLine) {
+                        let transitionLineJson = JSON.parse(lineObj.rawLine.substring(5).trim());
+                        transitionLineJson.candidates[0].content.parts = [{ text: cleanFinalText(lineObj.text) }];
+                        writer.write(encoder.encode(`data: ${JSON.stringify(transitionLineJson)}\n\n`));
+                        isThoughtFinished = true;
+                      }
+                      else {
+                        writer.write(encoder.encode(lineObj.rawLine + '\n\n'));
+                      }
                     }
+                    textBuffer = "";
                     writer.write(encoder.encode(line + '\n\n'));
                     passthroughMode = true;
                     continue;
                   }
                   else if (passthroughMode) {
-                    writer.write(encoder.encode(line));
+                    writer.write(encoder.encode(line + '\n\n'));
                     continue;
                   }
 
                   let responseText = parsedParts.responseText || "";
                   let isTransitionLine = false;
-                  let wasModified = false;
 
                   if (!isThoughtFinished && !hasGotBeginToken && isFormalResponseStarted(responseText)) {
-                    hasGotBeginToken = true;
-                    isTransitionLine = true;
-                    logDebug(config.debugMode, "Transition line detected.");
+                    let theCharBeforeBeginToken = linesBuffer[linesBuffer.length - 1]?.text.slice(-1) || lastSendChar;
+                    theCharBeforeBeginToken = responseText.split(BEGIN_TOKEN)[0] === "" ? theCharBeforeBeginToken : responseText.split(BEGIN_TOKEN)[0].slice(-1);
+                    if (theCharBeforeBeginToken != '`') {
+                      hasGotBeginToken = true;
+                      isTransitionLine = true;
+                      logDebug(config.debugMode, "Transition line detected.");
+                    }
                   }
-                  else if (isThoughtFinished && !hasGotBeginToken && isFormalResponseStarted(linesBuffer[-1]?.text || "" + responseText)) {
-                    hasGotBeginToken = true;
-                    isTransitionLine = true;
-                    responseText = linesBuffer[-1].text + responseText;
-                    wasModified = true;
-                    linesBuffer.pop();
-                    logDebug(config.debugMode, "Transition line detected. It takes two lines.");
+                  else if (!isThoughtFinished && !hasGotBeginToken && linesBuffer.length >= 1 && isFormalResponseStarted((linesBuffer[linesBuffer.length - 1]?.text) + responseText)) {
+                    let combinedText = linesBuffer[linesBuffer.length - 1].text + responseText;
+                    let theCharBeforeBeginToken = linesBuffer[linesBuffer.length - 2]?.text.slice(-1) || lastSendChar;
+                    theCharBeforeBeginToken = combinedText.split(BEGIN_TOKEN)[0] === "" ? theCharBeforeBeginToken : combinedText.split(BEGIN_TOKEN)[0].slice(-1);
+                    if (theCharBeforeBeginToken != '`') {
+                      hasGotBeginToken = true;
+                      isTransitionLine = true;
+                      responseText = combinedText;
+                      linesBuffer.pop();
+                      logDebug(config.debugMode, "Transition line detected. It takes two lines.");
+                    }
                   }
-                  else if (isThoughtFinished && !hasGotBeginToken && isFormalResponseStarted(linesBuffer[-2]?.text || "" + linesBuffer[-1]?.text || "" + responseText)) {
-                    hasGotBeginToken = true;
-                    isTransitionLine = true;
-                    responseText = linesBuffer[-2].text + linesBuffer[-1].text + responseText;
-                    wasModified = true;
-                    linesBuffer.pop() && linesBuffer.pop();
-                    logDebug(config.debugMode, "Transition line detected. It takes three lines.");
+                  else if (!isThoughtFinished && !hasGotBeginToken && linesBuffer.length >= 2 && isFormalResponseStarted((linesBuffer[linesBuffer.length - 2]?.text) + (linesBuffer[linesBuffer.length - 1]?.text) + responseText)) {
+                    let combinedText = linesBuffer[linesBuffer.length - 2].text + linesBuffer[linesBuffer.length - 1].text + responseText;
+                    let theCharBeforeBeginToken = linesBuffer[linesBuffer.length - 3]?.text.slice(-1) || lastSendChar;
+                    theCharBeforeBeginToken = combinedText.split(BEGIN_TOKEN)[0] === "" ? theCharBeforeBeginToken : combinedText.split(BEGIN_TOKEN)[0].slice(-1);
+                    if (theCharBeforeBeginToken != '`') {
+                      hasGotBeginToken = true;
+                      isTransitionLine = true;
+                      responseText = combinedText;
+                      linesBuffer.pop() && linesBuffer.pop();
+                      logDebug(config.debugMode, "Transition line detected. It takes three lines.");
+                    }
+                  }
+
+                  if (isTransitionLine) {
+                    let responseTextSplit = responseText.split(BEGIN_TOKEN);
+                    if (responseTextSplit[0].length > 0) {
+                      let lastThoughtLineJson = { candidates: [{ content: { parts: [{ text: responseTextSplit[0].trim(), thought: true }], role: "model" }, index: 0 }] };
+                      linesBuffer.push({ rawLine: `data: ${JSON.stringify(lastThoughtLineJson)}`, isTransitionLine: false, text: responseTextSplit[0].trim() });
+                    }
+                    responseText = BEGIN_TOKEN + responseTextSplit[1].trim();
                   }
 
 
-
-                  let lineToStore = line;
+                  let lineToStore = line.trim();
+                  let processedParts = [];
                   try {
-                    const data = JSON.parse(jsonStr);
-                    const parts = data?.candidates?.[0]?.content?.parts;
+                    // const data = JSON.parse(jsonStr);
+                    // const parts = data?.candidates?.[0]?.content?.parts;
 
                     if (Array.isArray(parts)) {
                       // logDebug(config.debugMode, "parts:", parts);
 
                       // Step 1: Filter out parts that are explicitly marked as thought.
                       // let processedParts = parts.filter(part => !part.thought);
-                      let processedParts = [{ text: responseText }];
-                      if (processedParts.length < parts.length) {
-                        wasModified = true;
+                      processedParts = [{ text: responseText }];
+                      for (const part of parts) {
+                        if (part.functionCall) {
+                          processedParts.push(part);
+                        }
                       }
+
 
                       // Step 2: If the thought phase is not finished, all remaining text parts are considered thoughts.
                       if (!isThoughtFinished && !hasGotBeginToken) {
-                        let markedAsThought = false;
                         processedParts.forEach(part => {
                           // Mark any part with text as a thought.
                           if (part.text) {
                             part.thought = true;
-                            markedAsThought = true;
                           }
                         });
-                        if (markedAsThought) {
-                          wasModified = true;
-                        }
                       }
 
-                      if (wasModified) {
-                        data.candidates[0].content.parts = processedParts;
-                        lineToStore = `data: ${JSON.stringify(data)}`;
-                        // logDebug(config.debugMode, `Processed thoughts. New line to store: ${lineToStore}`);
-                      }
+
+                      data.candidates[0].content.parts = processedParts;
+                      lineToStore = `data: ${JSON.stringify(data)}`;
+                      // logDebug(config.debugMode, `Processed thoughts. New line to store: ${lineToStore}`);
                     }
                   } catch (e) {
                     logDebug(config.debugMode, "Could not process thought parts, storing raw line.", e);
                   }
                   linesBuffer.push({ rawLine: lineToStore, isTransitionLine, text: responseText });
                   textBuffer += responseText;
-                  attempts > 1 && logDebug(config.debugMode, "responseText:", responseText);
+                  logDebug(config.debugMode, "responseText:", responseText);
 
                 } catch (e) {
                   logDebug(config.debugMode, "Error processing SSE line, forwarding as is.", line, e);
@@ -497,6 +574,24 @@ export async function handleStreamingRequest(request, config, url) {
 
               // --- Lookahead and Safe Forwarding ---
               if (textBuffer.length > LOOKAHEAD_SIZE) {
+
+                // 处理思维引导词鬼打墙问题
+                if ((accumulatedTextThisAttempt + textBuffer).split(config.startOfThought).length - 1 >= 2) {
+                  logDebug(config.debugMode, "Ghost loop detected. Start over again.");
+                  if (currentRequestBody.contents[currentRequestBody.contents.length - 1].role == "model") {
+                    let last_model_parts = currentRequestBody.contents[currentRequestBody.contents.length - 1].parts;
+                    last_model_parts[last_model_parts.length - 1].text = config.startOfThought;
+                  }
+                  break;
+                }
+
+                // 处理以BEGIN_TOKEN直接开头的情况
+                if (isIncludeThoughts && isFirstOutput && isFormalResponseStarted(textBuffer)) {
+                  logDebug(config.debugMode, "Thought response starts with BEGIN_TOKEN. Start over again.");
+                  break;
+                }
+
+
                 const safeTextLength = textBuffer.length - LOOKAHEAD_SIZE;
                 let forwardedTextLength = 0;
 
@@ -508,8 +603,7 @@ export async function handleStreamingRequest(request, config, url) {
                     // logDebug(config.debugMode, "rawLine:", lineObject.rawLine);
 
                     if (isFirstOutput && isIncludeThoughts) {
-                      isFirstOutput = false;
-                      writer.write(encoder.encode(`data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: accumulatedTextThisAttempt, thought: true }], role: "model" }, index: 0 }] })}\n\n`));
+                      writer.write(encoder.encode(`data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: config.startOfThought, thought: true }], role: "model" }, index: 0 }] })}\n\n`));
                     }
 
                     if (lineObject.isTransitionLine) {
@@ -523,9 +617,13 @@ export async function handleStreamingRequest(request, config, url) {
                     } else {
                       (isIncludeThoughts || isThoughtFinished) && writer.write(encoder.encode(lineObject.rawLine + '\n\n'));
                     }
-
+                    // 完成第一次输出，设置isFirstOutput为false
+                    if (isFirstOutput) {
+                      isFirstOutput = false;
+                    }
                     accumulatedTextThisAttempt += lineObject.text;
                     forwardedTextLength += lineObject.text.length;
+                    lastSendChar = accumulatedTextThisAttempt.slice(-1);
                   } else {
                     break;
                   }
@@ -545,7 +643,7 @@ export async function handleStreamingRequest(request, config, url) {
 
               // logDebug(config.debugMode, "sse done");
 
-              if ((hasGotBeginToken || isThoughtFinished) && isResponseComplete(textBuffer)) {
+              if ((hasGotBeginToken || isThoughtFinished) && (isResponseComplete(textBuffer) || isLiteModel)) {
                 logDebug(config.debugMode, "Streaming response is complete. Constructing final payload from buffers. textBuffer:", textBuffer);
 
                 // logDebug(config.debugMode, "linesBuffer content:", JSON.stringify(linesBuffer, null, 2));
@@ -623,27 +721,32 @@ export async function handleStreamingRequest(request, config, url) {
             }
           }
         } else {
+          const errorText = await upstreamResponse.text();
           logDebug(config.debugMode, `Streaming attempt ${attempts} failed with status ${upstreamResponse.status}`);
           if (FATAL_STATUS_CODES.includes(upstreamResponse.status)) {
             logDebug(config.debugMode, `Fatal status ${upstreamResponse.status} received. Aborting retries.`);
-            const errorData = await upstreamResponse.text();
-            writer.write(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: { code: upstreamResponse.status, message: "Upstream API returned a fatal error.", details: errorData } })}\n\n`));
+            logDebug(config.debugMode, `Upstream API returned a fatal error: ${errorText}`);
             //writer.close();
             //return;
             break;
           }
-          if (attempts > config.maxRetries) {
-            const errorData = await upstreamResponse.text();
-            writer.write(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: { code: upstreamResponse.status, message: "Upstream API error after max retries.", details: errorData } })}\n\n`));
-            //writer.close();
-            //return;
+          const isRetryableStatus = RETRYABLE_STATUS_CODES.includes(upstreamResponse.status);
+          if (attempts <= config.maxRetries && upstreamResponse.status == 429) {
+            if (errorText.toLowerCase().includes("quota exceeded for quota metric")) {
+              await sleep(1000);
+            }
+          }
+          const maxRetriesForThisError = isRetryableStatus ? config.maxRetries : MAX_NON_RETRYABLE_STATUS_RETRIES;
+
+          if (attempts > maxRetriesForThisError) {
+            logDebug(config.debugMode, `Upstream API error after max retries: ${errorText}`);
             break;
           }
         }
       } catch (error) {
         logDebug(config.debugMode, `Fetch error during streaming attempt ${attempts}:`, error);
         if (attempts > config.maxRetries) {
-          writer.write(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: { code: 500, message: "Internal Server Error after max retries.", details: error.message } })}\n\n`));
+          logDebug(config.debugMode, `Internal Server Error after max retries.`);
           //writer.close();
           //return;
           break;
@@ -661,7 +764,7 @@ export async function handleStreamingRequest(request, config, url) {
     const incompletePayload = {
       candidates: [{
         content: {
-          parts: [{ text: INCOMPLETE_TOKEN }]
+          parts: [{ text: `\n${INCOMPLETE_TOKEN}` }]
         },
         finishReason: "FXXKED",
         index: 0
@@ -694,8 +797,8 @@ export async function handleStreamingRequest(request, config, url) {
 
   process().catch(e => {
     logDebug(config.debugMode, "Unhandled error in streaming process:", e);
+    logDebug(config.debugMode, `Internal worker error: ${e.message}`);
     try {
-      writer.write(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: { code: 500, message: "Internal worker error.", details: e.message } })}\n\n`));
       writer.close();
     } catch (_) { /* writer might already be closed */ }
   }).finally(() => {

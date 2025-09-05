@@ -10,7 +10,7 @@
 export function parseConfig(env) {
   return {
     upstreamUrlBase: env.UPSTREAM_URL_BASE || "https://generativelanguage.googleapis.com",
-    maxRetries: Math.min(parseInt(env.MAX_RETRIES, 10) || 10, 48),
+    maxRetries: parseInt(env.MAX_RETRIES, 10),
     debugMode: env.DEBUG_MODE === "true",
     startOfThought: env.START_OF_THOUGHT || "Here's a thinking",
   };
